@@ -40,7 +40,7 @@ class TB6612Driver(Driver):
 
         self._stby = DigitalOutputDevice(stby, initial_value=True)
         self._left = Motor(forward=ain1, backward=ain2, enable=pwma)
-        self._right = Motor(forward=bin1, backward=bin2, enable=pwmb)
+        self._right = Motor(forward=bin2, backward=bin1, enable=pwmb)
 
     def apply(self, left: float, right: float) -> None:
         self._stby.on()
