@@ -39,7 +39,7 @@ class TB6612Driver(Driver):
         from gpiozero import DigitalOutputDevice, Motor
 
         self._stby = DigitalOutputDevice(stby, initial_value=True)
-        self._left = Motor(forward=ain2, backward=ain1, enable=pwma)
+        self._left = Motor(forward=ain1, backward=ain2, enable=pwma)
         self._right = Motor(forward=bin1, backward=bin2, enable=pwmb)
 
     def apply(self, left: float, right: float) -> None:
