@@ -1,0 +1,12 @@
+:root { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; color: #111; background: #fff; font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; font-weight: 400; font-size: 12px; color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input { font: inherit; color: inherit; }
+button, a, input { -webkit-tap-highlight-color: transparent; }
+button { cursor: pointer; border-radius: 0; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid #111; outline-offset: 4px; }
+a { color: inherit; }
+h1, h2, h3, p { margin: 0; }
+button { background: white; border: 1px solid #111; }
+::selection { background: #111; color: white; }

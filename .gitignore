@@ -1,3 +1,27 @@
 .env
 .venv
 __pycache__/
+
+# Frontend dependencies and generated output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-ssr/
+/frontend/**/*.tsbuildinfo
+
+# Frontend logs and local settings
+/frontend/logs/
+/frontend/**/*.log
+/frontend/**/*.local
+/frontend/**/.env.*
+!/frontend/**/.env.example
+
+# Frontend editor files
+/frontend/.vscode/*
+!/frontend/.vscode/extensions.json
+/frontend/**/.idea/
+/frontend/**/.DS_Store
+/frontend/**/*.suo
+/frontend/**/*.ntvs*
+/frontend/**/*.njsproj
+/frontend/**/*.sln
+/frontend/**/*.sw?
