@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RC Car Pilot</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background: #111; color: #ddd; margin: 0; }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; }
+  img#cam { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 4/3; object-fit: contain; }
+  .row { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 200px; padding: 10px; border-radius: 6px; border: 1px solid #333; background: #1c1c1c; color: #ddd; }
+  button { padding: 10px 16px; border: 0; border-radius: 6px; cursor: pointer; background: #264; color: #fff; }
+  button.go { background: #2a7; }
+  button.stop { background: #a33; }
+  button.ghost { background: #333; }
+  #status { font-family: monospace; font-size: 13px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px; white-space: pre-wrap; min-height: 60px; }
+  .scen { display: flex; flex-wrap: wrap; gap: 6px; }
+  .scen button { background: #383; font-size: 12px; padding: 6px 10px; }
+  fieldset { border: 1px solid #2a2a2a; border-radius: 8px; margin-top: 14px; padding: 12px; }
+  legend { font-size: 13px; color: #999; }
+  .hint { font-size: 12px; color: #777; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RC Car Pilot</h1>
+  <img id="cam" src="/video" alt="camera feed">
+  <div class="row">
+    <input id="target" type="text" placeholder="e.g. go to the red ball">
+    <button class="go" onclick="go()">Go</button>
+    <button class="stop" onclick="stop()">Stop</button>
+  </div>
+
+  <fieldset>
+    <legend>Fake scenarios (test steering math)</legend>
+    <div class="scen" id="scen"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Manual fake box override</legend>
+    <div class="row">
+      <input id="box" type="text" placeholder="ymin,xmin,ymax,xmax  (0-1000)">
+      <button class="ghost" onclick="setBox()">Set box</button>
+      <button class="ghost" onclick="setBox(null)">Set none</button>
+      <button class="ghost" onclick="clearBox()">Clear override</button>
+    </div>
+  </fieldset>
+
+  <div id="status">idle</div>
+  <div class="hint">In fake mode, the car keeps the last command during the pause. Detection runs every 5s, starting immediately on Go.</div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  const SCENARIOS = ['center', 'left', 'right', 'slight_right', 'slight_left', 'huge', 'not_found', 'approach'];
+
+  SCENARIOS.forEach((name) => {
+    const btn = document.createElement('button');
+    btn.textContent = name;
+    btn.onclick = () => post('/debug/scenario', { name });
+    $('scen').appendChild(btn);
+  });
+
+  async function post(url, body) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    if (!res.ok) alert((await res.json()).detail || res.statusText);
+    refresh();
+  }
+
+  async function go() {
+    const target = $('target').value.trim();
+    if (!target) return alert('enter a target first');
+    await post('/direct', { target });
+  }
+
+  function stop() { post('/stop'); }
+
+  async function setBox() {
+    const value = $('box').value.trim();
+    if (!value) return alert('enter ymin,xmin,ymax,xmax');
+    const parts = value.split(',').map((s) => parseInt(s, 10));
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return alert('need 4 integers');
+    await post('/debug/box', { box: parts });
+  }
+
+  function clearBox() { post('/debug/box/clear'); }
+
+  async function refresh() {
+    try {
+      const s = await (await fetch('/status')).json();
+      $('status').textContent = JSON.stringify(s, null, 2);
+    } catch (_) {}
+  }
+
+  setInterval(refresh, 1000);
+  refresh();
+</script>
+</body>
+</html>
