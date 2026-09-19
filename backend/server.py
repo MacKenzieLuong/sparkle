@@ -44,6 +44,8 @@ class ControlLoop:
         self._vision = vision
         self._driver = driver
         self._interval = _env_float("CONTROL_INTERVAL", 5.0)
+        self._short_interval = _env_float("SHORT_INTERVAL", 1.0)
+        self._short_interval_area = _env_float("SHORT_INTERVAL_AREA", 0.15)
         self._miss_limit = 3
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -54,6 +56,7 @@ class ControlLoop:
             "cycle": 0,
             "missed": 0,
             "last_command": None,
+            "infer": {"count": 0, "frame_no": None, "label": None, "box_2d": None},
         }
 
     def start(self, target: str) -> None:
@@ -64,6 +67,12 @@ class ControlLoop:
             self.state["cycle"] = 0
             self.state["missed"] = 0
             self.state["last_command"] = None
+            self.state["infer"] = {
+                "count": 0,
+                "frame_no": None,
+                "label": None,
+                "box_2d": None,
+            }
         if self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
@@ -78,9 +87,16 @@ class ControlLoop:
         with self._lock:
             return dict(self.state)
 
+    def _pause(self, area_fraction: Optional[float]) -> float:
+        if area_fraction is not None and area_fraction >= self._short_interval_area:
+            return self._short_interval
+        return self._interval
+
     def _run(self) -> None:
+        last_area: Optional[float] = None
         while self._is_running():
             frame = self._camera.read()
+            frame_no = self._camera.frame_no
             with self._lock:
                 target = self.state["target"]
 
@@ -93,6 +109,13 @@ class ControlLoop:
 
             with self._lock:
                 self.state["cycle"] += 1
+                infer = self.state["infer"]
+                infer["count"] += 1
+                infer["frame_no"] = frame_no
+                infer["label"] = detection.label if detection else None
+                infer["box_2d"] = (
+                    list(detection.box_2d) if detection else None
+                )
 
             if detection is None:
                 with self._lock:
@@ -107,6 +130,7 @@ class ControlLoop:
                 with self._lock:
                     self.state["missed"] = 0
                 cmd = command(detection.box_2d)
+                last_area = cmd.area_fraction
                 self._driver.apply(cmd.left, cmd.right)
                 with self._lock:
                     self.state["last_command"] = {
@@ -116,6 +140,7 @@ class ControlLoop:
                         "note": cmd.note,
                         "label": detection.label,
                         "box_2d": list(detection.box_2d),
+                        "area_fraction": round(cmd.area_fraction, 3),
                     }
                     self.state["status"] = cmd.status
                     if cmd.status == "arrived":
@@ -124,7 +149,7 @@ class ControlLoop:
                     self._driver.stop()
                     break
 
-            time.sleep(self._interval)
+            time.sleep(self._pause(last_area))
 
     def _is_running(self) -> bool:
         with self._lock:
@@ -180,8 +205,67 @@ def _build_app(env: Optional[dict] = None):
     def video():
         def gen():
             while True:
+                frame = camera.read()
+                frame_no = camera.frame_no
+                h, w = frame.shape[:2]
+                snap = loop.snapshot()
+                infer = snap.get("infer") or {}
+                infer_no = infer.get("frame_no")
+                box = infer.get("box_2d")
+
+                cv2.putText(
+                    frame,
+                    f"FRAME {frame_no}",
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                if infer_no == frame_no:
+                    label = infer.get("label") or ""
+                    cv2.putText(
+                        frame,
+                        f"INFER RAN HERE (#{infer.get('count', 0)}) {label}",
+                        (10, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                else:
+                    cv2.putText(
+                        frame,
+                        f"last infer #{infer.get('count', 0)} @ frame {infer_no}",
+                        (10, 48),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (200, 200, 200),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                if box is not None:
+                    ymin, xmin, ymax, xmax = [int(v) for v in box]
+                    x1 = int(xmin / 1000 * w)
+                    y1 = int(ymin / 1000 * h)
+                    x2 = int(xmax / 1000 * w)
+                    y2 = int(ymax / 1000 * h)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(
+                        frame,
+                        str(infer.get("label") or "?"),
+                        (x1 + 6, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
                 ok, buf = cv2.imencode(
-                    ".jpg", camera.read(), [cv2.IMWRITE_JPEG_QUALITY, 70]
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
                 )
                 if ok:
                     yield (

@@ -17,6 +17,7 @@ class DriveCommand:
     right: float
     status: str
     note: str = ""
+    area_fraction: float = 0.0
 
 
 def _clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -34,7 +35,9 @@ def command(box_2d: Optional[Tuple[int, int, int, int]]) -> DriveCommand:
     area_fraction = (box_width * box_height) / 1_000_000.0
 
     if area_fraction >= ARRIVED_AREA_FRACTION:
-        return DriveCommand(0.0, 0.0, "arrived", f"area {area_fraction:.2f}")
+        return DriveCommand(
+            0.0, 0.0, "arrived", f"area {area_fraction:.2f}", area_fraction
+        )
 
     dx = (center_x - FRAME_CENTER) / float(FRAME_CENTER)
     scale = max(MIN_SPEED_SCALE, 1.0 - area_fraction / ARRIVED_AREA_FRACTION)
@@ -45,4 +48,6 @@ def command(box_2d: Optional[Tuple[int, int, int, int]]) -> DriveCommand:
     left = _clamp(speed + turn)
     right = _clamp(speed - turn)
 
-    return DriveCommand(left, right, "moving", f"dx {dx:.2f}, area {area_fraction:.2f}")
+    return DriveCommand(
+        left, right, "moving", f"dx {dx:.2f}, area {area_fraction:.2f}", area_fraction
+    )

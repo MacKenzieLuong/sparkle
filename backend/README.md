@@ -23,7 +23,7 @@ User types "go to the red ball" on web page
         │  box size → approach speed; box ~50%+ of frame → arrived
         ▼
    Motor driver ──► left/right throttle in [-1, 1]
-        │  H-bridge (L298N) on GPIO or fake (logs)
+        │  H-bridge (dual TB6612FNG) on GPIO or fake (logs)
         └─ holds last command during the pause between inference calls
 ```
 
@@ -35,7 +35,7 @@ User types "go to the red ball" on web page
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (real inference via yibuapi) |
 | `controller.py` | Pure steering math: bounding box → `DriveCommand(left, right, status)` |
 | `camera.py` | `PiCamera` (picamera2 CSI), `FakeCamera` (synthetic frames) |
-| `drive.py` | `L298NDriver` (gpiozero), `FakeDriver` (logs) |
+| `drive.py` | `TB6612Driver` (dual TB6612FNG, gpiozero), `FakeDriver` (logs) |
 | `scenarios.py` | Scripted bounding-box scenarios shared by `FakeVision` and `FakeCamera` |
 | `static/index.html` | Web UI: camera preview, target input, scenario/box debug controls |
 | `test_controller.py`, `test_vision.py` | pytest suites |
@@ -107,9 +107,14 @@ is not in frame.
 On `POST /direct`:
 
 1. Detection runs **immediately** (starts on "go", no initial pause).
-2. During the pause between calls (`CONTROL_INTERVAL`, default 5s) the car
-   keeps driving the **last commanded** direction.
-3. Exit conditions (checked on detection cycles):
+2. During the pause between calls the car keeps driving the **last commanded**
+   direction.
+3. The pause is adaptive: while the target is far, calls run every
+   `CONTROL_INTERVAL` (default 5s). Once the target's bounding box covers ≥
+   `SHORT_INTERVAL_AREA` (default 0.15) of the frame, the cadence tightens to
+   `SHORT_INTERVAL` (default 1s) for precise final alignment — same per-call
+   cost, ~5× more steering updates near the target.
+4. Exit conditions (checked on detection cycles):
    - **arrived** — bounding box covers ≥ 50% of the frame → stop.
    - **target_lost** — no detection for 3 consecutive cycles → stop.
    - **manual stop** — `POST /stop`.
@@ -134,7 +139,7 @@ On `POST /direct`:
 | POST | `/direct` | Body `{"target": "the red ball"}` — start the control loop |
 | POST | `/stop` | Stop the car and the loop |
 | GET | `/status` | Loop state: running/target/status/cycle/last command/mock |
-| GET | `/video` | MJPEG camera stream (free preview, no inference) |
+| GET | `/video` | MJPEG camera stream (free preview, no inference) — overlays the live frame number, and highlights `INFER RAN HERE` on the exact frame the control loop used, plus the last inferred box |
 | GET | `/debug/scenarios` | List scripted fake scenarios |
 | POST | `/debug/scenario` | Body `{"name": "approach"}` — load a scripted scenario (mock only) |
 | POST | `/debug/box` | Body `{"box": [ymin,xmin,ymax,xmax]}` or `{"box": null}` — override the fake box (mock only) |
@@ -151,12 +156,14 @@ Debug endpoints return `400` when the providers are not fake.
 | `HUAWEI_BASE_URL` | `https://yibuapi.com/v1` | OpenAI-compatible gateway base URL |
 | `HUAWEI_MODEL` | `qwen3.5-omni-flash` | Model used for detection |
 | `CAMERA` | `fake` | `fake` or `picamera2` |
-| `DRIVER` | `fake` | `fake` or `l298n` |
+| `DRIVER` | `fake` | `fake` or `tb6612` (`l298n` accepted as an alias) |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | Frame resolution |
-| `CONTROL_INTERVAL` | `5` | Seconds between inference calls (the pause) |
+| `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far |
+| `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
+| `SHORT_INTERVAL_AREA` | `0.15` | Box area fraction (of the 1000×1000 frame) that triggers the fast cadence |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
-| `L298N_LEFT_FWD`…`L298N_STBY` | see `.env.example` | GPIO pins for the motor driver (SparkFun) |
-| `L298N_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |
+| `TB6612_AIN1`…`TB6612_STBY` | see `.env.example` | GPIO pins for the dual TB6612FNG (SparkFun) |
+| `TB6612_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |
 
 ## Tests
 
@@ -164,8 +171,10 @@ Debug endpoints return `400` when the providers are not fake.
 .venv/bin/python -m pytest
 ```
 
-Covers the steering math (`test_controller.py`) and the lenient JSON box
-parsing used in real mode (`test_vision.py`). No network, no API usage.
+Covers the steering math (`test_controller.py`), the lenient JSON box
+parsing used in real mode (`test_vision.py`), the adaptive pause and
+inference-overlay state (`test_server.py`), and per-frame camera counters
+(`test_camera.py`). No network, no API usage.
 
 ## Running on the Pi
 
@@ -173,18 +182,52 @@ parsing used in real mode (`test_vision.py`). No network, no API usage.
 export MOCK=false
 export HUAWEI_API_KEY=<key>
 export CAMERA=picamera2
-export DRIVER=l298n
-export L298N_LEFT_FWD=17 L298N_LEFT_REV=27 L298N_LEFT_EN=13
-export L298N_RIGHT_FWD=16 L298N_RIGHT_REV=20 L298N_RIGHT_EN=12
-export L298N_STBY=21
+export DRIVER=tb6612
+export TB6612_AIN1=17 TB6612_AIN2=27 TB6612_PWMA=13
+export TB6612_BIN1=16 TB6612_BIN2=20 TB6612_PWMB=12
+export TB6612_STBY=21
 .venv/bin/python server.py
 ```
 
 `picamera2`, `gpiozero`, and `openai` require `pip install -r requirements.txt`
 (picamera2 is arm/Linux-only). The mapping follows the SparkFun handoff:
-**Motor A = left wheel** (AI1=17, AI2=27, PWMA=13), **Motor B = right wheel**
-(BI1=16, BI2=20, PWMB=12), **STBY=21**. The code never swaps A/B for
-forward/reverse/turn behavior; if a wheel spins backwards, swap that motor's
-two output wires physically. The car drives slowly (the loop is paced by API
+**Motor A = left wheel** (AIN1=17, AIN2=27, PWMA=13), **Motor B = right wheel**
+(BIN1=16, BIN2=20, PWMB=12), **STBY=21**. The code never swaps A/B for
+forward/reverse/turn behavior. If a wheel spins backwards, flip that motor's
+direction in software (`drive.py`). The car drives slowly (the loop is paced by API
 latency + `CONTROL_INTERVAL`), so allow plenty of room. Point the web UI at
 the Pi's LAN address and the video preview shows the car's view.
+
+## Benchmarks
+
+Measured on macOS (2026 M-series) with the mock stack and `CONTROL_INTERVAL=5`;
+real hardware keeps the same structure, only the absolute per-cell ms values
+move.
+
+**Per-stage local cost** (mean / 99th percentile):
+
+| stage | mean | 99th |
+| --- | --- | --- |
+| `camera.read()` fake 640×480 render | 0.038 ms | 0.048 ms |
+| JPEG encode q85 | 0.566 ms | 0.662 ms |
+| base64 of that JPEG | 0.581 ms | 0.659 ms |
+| `controller.command()` (center/right/None) | ≤ 0.002 ms | — |
+| `driver.apply()` (fake) | ~0.000 ms | — |
+| full local detect→compute→apply cycle | 0.003 ms | 0.008 ms |
+
+Local cost is a rounding error: the control loop's latency is entirely
+`api_latency + pause`. First command lands `api_latency + ~25 ms` after `go`
+(the ~25 ms is read+encode+parse+compute+apply on the Pi).
+
+**Cadence with and without near-target optimization** (fixed mimic API latencies):
+
+| api mimic | first cmd latency | far cadence `5s` | near cadence `1s` | cycles/min near |
+| --- | --- | --- | --- | --- |
+| 0.0 (mock) | ~25 ms | 5.000 s | 1.000 s | 60 |
+| 0.5 s | ~528 ms | 5.500 s | 1.500 s | 40 |
+| 1.0 s | ~1030 ms | 6.000 s | 2.000 s | 30 |
+| 2.0 s | ~2029 ms | 7.000 s | 3.000 s | 20 |
+
+Steady-state cadence is exactly `pause + api` (no jitter), so with a real
+~1–2 s API round trip the car gets 20–40 steering updates per minute during
+final approach instead of ~10.

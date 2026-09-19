@@ -65,3 +65,11 @@ def test_bigger_target_slows_down():
     assert near.status == "moving"
     assert near.left < far.left
     assert near.right < far.right
+
+
+def test_area_fraction_reported():
+    cmd = command((300, 300, 700, 700))
+    assert cmd.area_fraction == pytest.approx(0.16)
+    assert command((420, 300, 580, 700)).area_fraction < 0.16
+    assert command(None).area_fraction == 0.0
+    assert command((120, 120, 880, 880)).area_fraction == pytest.approx(0.5776)
