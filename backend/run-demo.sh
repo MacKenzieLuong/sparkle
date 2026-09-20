@@ -66,10 +66,10 @@ setting VISION_SPACING 1.0
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
 # The stiction minimum is most of what reaches the wheel, so this is not
-# proportional to speed: 0.075 puts the left wheel at 0.26 against 0.35 at
-# 0.2. Matches .env.example so both launchers drive the same.
-setting BASE_SPEED 0.075
-setting TURN_GAIN 0.35
+# proportional to speed: 0.20 puts the left wheel at 0.35. Much below this the
+# car can stall mid-drive, and the kick only fires on a command leaving rest.
+setting BASE_SPEED 0.20
+setting TURN_GAIN 0.25
 # Seconds of lead in the steering error, cancelling the rotation the car keeps
 # after the power is cut. 0 is the plain proportional turn, which overshoots on
 # a chassis with any momentum; set it from the coast calibrate.py measures.
