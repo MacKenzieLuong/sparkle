@@ -41,6 +41,11 @@ setting DRIVER tb6612
 setting VISION_WIDTH 320
 setting VISION_HEIGHT 240
 setting VISION_EXPLAIN false
+# Requests in flight at once. Qwen Realtime cannot take local frames, so the
+# only way to hear from the model more often over HTTP is to overlap calls.
+# Costs one full call per worker: 3 here means 3x the spend for 3x the rate.
+setting VISION_CONCURRENCY 3
+setting VISION_STAGGER 1.2
 
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.

@@ -44,11 +44,18 @@ VERIFY_ANSWER = "red"
 MIN_IMAGE_TOKENS = 25
 
 
-def test_frame(width: int = 320, height: int = 240) -> str:
-    """A grey frame with one red circle, right of centre. Known ground truth."""
+def test_frame(width: int = 320, height: int = 240, number: str = "") -> str:
+    """A red circle plus a two-digit number the model cannot guess.
+
+    Colour was a useless check: asked with no picture at all, the model still
+    answered "red". A random number is 1-in-90, so naming it is proof.
+    """
     frame = np.full((height, width, 3), 210, np.uint8)
     cv2.circle(frame, (int(width * 0.7), height // 2), height // 6, (40, 40, 220), -1)
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if number:
+        cv2.putText(frame, number, (20, height - 40), cv2.FONT_HERSHEY_SIMPLEX,
+                    2.2, (20, 20, 20), 5, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ok:
         raise RuntimeError("could not encode the test frame")
     return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()

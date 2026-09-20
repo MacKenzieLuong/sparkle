@@ -124,6 +124,29 @@ Requests use a `VISION_TIMEOUT` (default 10s) with **retries disabled**: a
 retry would re-send a frame describing where the car used to be, so failing
 fast and sending a fresh frame next cycle is both cheaper and more correct.
 
+## Why calls overlap
+
+One model call takes 2.5-4.3s and that cannot be reduced: Qwen's Realtime
+WebSocket was probed against yibuapi's own documented protocol and will not
+accept a local frame in any of nine content shapes, verified by input-token
+count rather than by the absence of an error (see `realtime_probe.py`). Its
+`image_url` field wants a fetchable http(s) URL, which would mean uploading
+every frame — slower, not faster.
+
+So the only way to hear from the model more often is to have several requests
+in flight. `VISION_CONCURRENCY` workers each hold one, staggered by
+`VISION_STAGGER`, and the decision rate rises almost linearly:
+
+| workers | decision every | cost |
+| --- | --- | --- |
+| 1 | ~3.4 s | 1x |
+| 2 | ~1.7 s | 2x |
+| 3 | ~1.1 s | 3x |
+
+Replies then finish out of order. Every result is keyed on when its frame was
+*captured*, and one describing an older frame is dropped rather than allowed to
+replace a newer decision; `/status` counts those as `out_of_order`.
+
 ## Talking to the model from the terminal
 
 `cli.py` runs one detection and prints what came back — no server, no motors.
@@ -349,6 +372,8 @@ Debug endpoints return `400` when the providers are not fake.
 | `VISION_TIMEOUT` | `10` | Per-request timeout in seconds; retries are disabled |
 | `VISION_WIDTH` / `VISION_HEIGHT` | `0` / `0` | Downscale before sending; `0` keeps camera resolution. 320x240 is 80 image tokens against 300 at 640x480 |
 | `VISION_EXPLAIN` | `false` | Ask the model to justify its action. Readable while tuning, but output tokens are generated serially and cost latency on every call |
+| `VISION_CONCURRENCY` | `1` | Requests in flight at once. `3` gives a decision ~3x as often, and costs 3x |
+| `VISION_STAGGER` | `1.2` | Seconds between worker starts, so overlapping requests spread out instead of bunching |
 | `MAX_COST_USD` | `1.00` | Estimated spend cap for the process; `0` disables it |
 | `VISION_INPUT_USD_PER_MILLION` | `0.55` | Image-token input rate used by the estimate |
 | `VISION_OUTPUT_USD_PER_MILLION` | `2.20` | Output-token rate used by the estimate |

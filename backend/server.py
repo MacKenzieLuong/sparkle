@@ -78,6 +78,11 @@ class ControlLoop:
         self._miss_limit = 3
         self._arrive_confirm = int(os.environ.get("ARRIVE_CONFIRM", "2"))
         self._search_limit = int(os.environ.get("SEARCH_LIMIT", "8"))
+        # Requests in flight at once. One model call takes seconds, so the only
+        # way to hear from it more often over HTTP is to have several running.
+        # Costs one full call per worker per cycle.
+        self._concurrency = max(1, int(os.environ.get("VISION_CONCURRENCY", "1")))
+        self._stagger = _env_float("VISION_STAGGER", 1.2)
         # Last resort: if the network drops, /stop is unreachable and nothing
         # else bounds a drive that never arrives.
         self._max_run_seconds = _env_float("MAX_RUN_SECONDS", 120.0)
@@ -87,6 +92,11 @@ class ControlLoop:
         self._latest_at: Optional[float] = None
         self._cycle_time: Optional[float] = None
         self._started_at = 0.0
+        self._published_at: Optional[float] = None
+        self._previous_publish: Optional[float] = None
+        self._arrived_streak = 0
+        self._search_streak = 0
+        self._last_terminal: Optional[str] = None
         self.state = {
             "running": False,
             "target": None,
@@ -96,6 +106,7 @@ class ControlLoop:
             "missed": 0,
             "arrived_streak": 0,
             "search_streak": 0,
+            "out_of_order": 0,
             "action": None,
             "error": None,
             "detection_age": None,
@@ -113,6 +124,11 @@ class ControlLoop:
             self._latest_at = None
             self._cycle_time = None
             self._started_at = time.monotonic()
+            self._published_at = None
+            self._previous_publish = None
+            self._arrived_streak = 0
+            self._search_streak = 0
+            self._last_terminal = None
             self.state.update(
                 running=True,
                 target=target,
@@ -122,14 +138,18 @@ class ControlLoop:
                 missed=0,
                 arrived_streak=0,
                 search_streak=0,
+                out_of_order=0,
                 action=None,
                 error=None,
                 detection_age=None,
                 last_command=None,
                 infer=_blank_infer(),
             )
-        for worker in (self._perceive, self._control):
-            threading.Thread(target=worker, args=(epoch,), daemon=True).start()
+        for index in range(self._concurrency):
+            threading.Thread(
+                target=self._perceive, args=(epoch, index), daemon=True
+            ).start()
+        threading.Thread(target=self._control, args=(epoch,), daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
@@ -171,92 +191,109 @@ class ControlLoop:
         self._driver.stop()
         self._vision.stop()
 
-    def _perceive(self, epoch: int) -> None:
+    def _publish(
+        self,
+        epoch: int,
+        detection: Optional[DetectedObject],
+        captured_at: float,
+        frame_no: Optional[int],
+        error: Optional[str],
+    ) -> Optional[str]:
+        """Record one result and say whether the run should end.
+
+        Shared by every perception worker, so the streak counters stay in one
+        place. Results are keyed on when the frame was *captured*, not when the
+        reply arrived: with several requests in flight they finish out of order,
+        and a decision about an older frame must never replace a newer one.
+        """
+        with self._lock:
+            if not self._owns(epoch):
+                return None
+            if self._published_at is not None and captured_at <= self._published_at:
+                self.state["out_of_order"] += 1
+                return None
+            self._published_at = captured_at
+            if self._previous_publish is not None:
+                self._cycle_time = captured_at - self._previous_publish
+            self._previous_publish = captured_at
+
+            self.state["cycle"] += 1
+            self.state["error"] = error
+            infer = self.state["infer"]
+            infer["count"] += 1
+            infer["frame_no"] = frame_no
+            infer["label"] = detection.label if detection else None
+            infer["box_2d"] = (
+                list(detection.box_2d) if detection and detection.box_2d else None
+            )
+            infer["action"] = detection.action if detection else None
+            infer["reason"] = detection.reason if detection else None
+
+            if detection is None:
+                self.state["missed"] += 1
+                if self.state["missed"] >= self._miss_limit:
+                    return "target_lost"
+                return None
+
+            self.state["missed"] = 0
+            self._latest = detection
+            self._latest_at = time.monotonic()
+            self.state["action"] = detection.action
+
+            searching = detection.action in ("search_left", "search_right")
+            self._search_streak = self._search_streak + 1 if searching else 0
+            self.state["search_streak"] = self._search_streak
+
+            terminal = (
+                "arrived" if act(detection.action, detection.box_2d).status == "arrived"
+                else "halted" if detection.action == "stop"
+                else None
+            )
+            if terminal is None:
+                self._arrived_streak = 0
+            elif terminal == self._last_terminal:
+                self._arrived_streak += 1
+            else:
+                self._arrived_streak = 1
+            self._last_terminal = terminal
+            self.state["arrived_streak"] = self._arrived_streak
+
+            if terminal is not None and self._arrived_streak >= self._arrive_confirm:
+                return terminal
+            if self._search_streak >= self._search_limit:
+                return "target_lost"
+            return None
+
+    def _perceive(self, epoch: int, index: int = 0) -> None:
+        """One request in flight. Several of these run when pipelining."""
+        if index:
+            # Spread the workers out, or they bunch up and the gap between
+            # decisions is no better than with one.
+            time.sleep(self._stagger * index)
         area: Optional[float] = None
-        previous_finish: Optional[float] = None
-        arrived_streak = 0
-        search_streak = 0
-        last_terminal: Optional[str] = None
         while self._active(epoch):
             frame_no = None
             error = None
             detection = None
+            captured_at = time.monotonic()
             try:
                 frame = self._camera.read()
                 frame_no = self._camera.frame_no
+                captured_at = time.monotonic()
                 with self._lock:
                     target = self.state["target"]
                 detection = self._vision.detect(target or "", frame)
             except Exception as exc:
                 error = str(exc)
 
-            now = time.monotonic()
-            with self._lock:
-                if not self._owns(epoch):
-                    return
-                if previous_finish is not None:
-                    # Reported for tuning STALE_AFTER; not load-bearing.
-                    self._cycle_time = now - previous_finish
-                self.state["cycle"] += 1
-                self.state["error"] = error
-                infer = self.state["infer"]
-                infer["count"] += 1
-                infer["frame_no"] = frame_no
-                infer["label"] = detection.label if detection else None
-                infer["box_2d"] = (
-                    list(detection.box_2d) if detection and detection.box_2d else None
-                )
-                infer["action"] = detection.action if detection else None
-                infer["reason"] = detection.reason if detection else None
-                if detection is None:
-                    self.state["missed"] += 1
-                else:
-                    self.state["missed"] = 0
-                    self._latest = detection
-                    self._latest_at = now
-                lost = self.state["missed"] >= self._miss_limit
-            previous_finish = now
-
-            if lost:
-                self._finish("target_lost", epoch)
+            terminal = self._publish(epoch, detection, captured_at, frame_no, error)
+            if terminal is not None:
+                self._finish(terminal, epoch)
                 return
 
             if detection is not None:
                 result = act(detection.action, detection.box_2d)
                 area = result.area_fraction
-
-                # A search that never finds anything must still end. The model
-                # decides which way to look; this bounds how long it may look.
-                searching = detection.action in ("search_left", "search_right")
-                search_streak = search_streak + 1 if searching else 0
-
-                # One hallucinated full-frame box reads as arrival. The control
-                # thread already halts on it; only end the run once successive
-                # detections agree, so a bad frame costs a pause, not the drive.
-                terminal = (
-                    "arrived" if result.status == "arrived"
-                    else "halted" if detection.action == "stop"
-                    else None
-                )
-                if terminal is None:
-                    arrived_streak = 0
-                elif terminal == last_terminal:
-                    arrived_streak += 1
-                else:
-                    arrived_streak = 1
-                last_terminal = terminal
-
-                with self._lock:
-                    self.state["arrived_streak"] = arrived_streak
-                    self.state["search_streak"] = search_streak
-                    self.state["action"] = detection.action
-
-                if terminal is not None and arrived_streak >= self._arrive_confirm:
-                    self._finish(terminal, epoch)
-                    return
-                if search_streak >= self._search_limit:
-                    self._finish("target_lost", epoch)
-                    return
             time.sleep(self._pause(area))
 
     def _control(self, epoch: int) -> None:

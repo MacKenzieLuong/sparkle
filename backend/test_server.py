@@ -380,6 +380,50 @@ def test_model_stop_needs_confirming_too():
     assert snap["running"] is True, "a lone stop ended the run"
 
 
+def test_pipelining_raises_the_decision_rate():
+    """Three requests in flight should deliver decisions ~3x as often."""
+    def rate(concurrency):
+        with _env(
+            MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100",
+            STALE_AFTER="30", VISION_CONCURRENCY=str(concurrency), VISION_STAGGER="0.1",
+        ):
+            loop = ControlLoop(
+                FakeCamera(FakeScene(boxes=[])),
+                SlowVision(MOVING_BOX, delay=0.3),
+                FakeDriver(),
+            )
+            loop.start("a chair")
+            time.sleep(1.2)
+            cycles = loop.snapshot()["cycle"]
+            loop.stop()
+            return cycles
+
+    single = rate(1)
+    triple = rate(3)
+    assert triple > single * 1.8, f"pipelining gained nothing: {single} -> {triple}"
+
+
+def test_out_of_order_replies_never_overwrite_a_newer_one():
+    """Concurrent requests finish out of order; the older one must be dropped."""
+    with _env(MOCK="true", STALE_AFTER="30"):
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX), FakeDriver()
+        )
+        loop.start("a chair")
+        newer = DetectedObject(box_2d=MOVING_BOX, label="newer", action="approach")
+        older = DetectedObject(box_2d=MOVING_BOX, label="older", action="approach")
+        epoch = loop._epoch
+
+        assert loop._publish(epoch, newer, 100.0, 1, None) is None
+        assert loop._publish(epoch, older, 90.0, 2, None) is None
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["infer"]["label"] == "newer", "a stale reply replaced a fresher one"
+    assert snap["out_of_order"] == 1
+    assert snap["cycle"] == 1, "the dropped reply should not count as a cycle"
+
+
 def test_run_stops_at_the_time_limit():
     """The backstop for a drive nobody can reach to stop."""
     with _env(
