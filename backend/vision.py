@@ -209,6 +209,56 @@ class OmniVision(VisionProvider):
         return prompt
 
 
+class LocalVision(VisionProvider):
+    """Rule-based fallback that needs no network and no key.
+
+    Looks for the iconic red of a Red Bull / red-ball target in HSV space and
+    steers at the largest blob. Purely local, so it is a stopgap for when the
+    inference gateway is unreachable — not a replacement for the model's
+    reasoning. Selected with VISION_PROVIDER=local (MOCK=false).
+    """
+
+    def __init__(self):
+        self._min_area = _env_float("LOCAL_MIN_AREA", 0.01)
+        self._misses = 0
+        self.last_raw = "local: red-blob detection"
+
+    def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
+        height, width = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        red_low = cv2.inRange(hsv, (0, 90, 60), (10, 255, 255))
+        red_high = cv2.inRange(hsv, (170, 90, 60), (179, 255, 255))
+        mask = cv2.morphologyEx(
+            red_low | red_high, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
+        )
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_area = 0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > best_area:
+                best_area = area
+                best = contour
+        if best is None or best_area < self._min_area * width * height:
+            # Keep turning the same way the last few misses suggested, so the
+            # car sweeps the room instead of rocking left-right-left.
+            self._misses += 1
+            action = "search_left" if self._misses % 2 else "search_right"
+            return DetectedObject(
+                box_2d=None, label=target, action=action,
+                reason="no red target in frame",
+            )
+        self._misses = 0
+        x, y, w, h = cv2.boundingRect(best)
+        box = (
+            min(y * 1000 // height, 1000),
+            min(x * 1000 // width, 1000),
+            min((y + h) * 1000 // height, 1000),
+            min((x + w) * 1000 // width, 1000),
+        )
+        return DetectedObject(box_2d=box, label="red target", reason="local red blob")
+
+
 HISTORY_LENGTH = 4
 
 
@@ -304,13 +354,20 @@ BOX_KEYS = ("box_2d", "bbox_2d", "bbox", "box", "bounding_box")
 def _coords_of(entry: dict) -> Optional[List]:
     for key in BOX_KEYS:
         value = entry.get(key)
-        if isinstance(value, (list, tuple)) and len(value) == 4:
-            return list(value)
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            continue
+        # The model fills a missing box with nulls ("[null,null,null,null]")
+        # instead of quoting an empty array; those are not coordinates.
+        if not all(isinstance(v, (int, float)) for v in value):
+            continue
+        return list(value)
     return None
 
 
 def make_vision(scene: Optional[FakeScene] = None) -> VisionProvider:
     if not is_mock():
+        if os.environ.get("VISION_PROVIDER", "").strip().lower() == "local":
+            return LocalVision()
         return OmniVision(
             api_key=os.environ.get("HUAWEI_API_KEY", ""),
             base_url=os.environ.get("HUAWEI_BASE_URL", DEFAULT_BASE_URL),

@@ -34,6 +34,7 @@ from tracker import BoxTracker
 from vision import (
     DetectedObject,
     FakeVision,
+    LocalVision,
     OmniVision,
     VisionProvider,
     is_mock,
@@ -608,7 +609,7 @@ def _banner(camera, vision, driver, loop) -> str:
     lines = [
         "",
         "=" * 62,
-        f"  vision   : {'FAKE (scripted boxes)' if is_mock() else 'LIVE ' + os.environ.get('HUAWEI_MODEL', 'qwen3.8-omni-flash')}",
+        f"  vision   : {'FAKE (scripted boxes)' if is_mock() else ('LOCAL (OpenCV red blob)' if isinstance(vision, LocalVision) else 'LIVE ' + os.environ.get('HUAWEI_MODEL', 'qwen3.8-omni-flash'))}",
         f"  camera   : {type(camera).__name__}"
         + (f"  rotated {os.environ['CAMERA_ROTATION']}deg" if os.environ.get("CAMERA_ROTATION", "0") != "0" else ""),
         f"  driver   : {type(driver).__name__}"
@@ -619,7 +620,7 @@ def _banner(camera, vision, driver, loop) -> str:
         f"  limits   : STALE_AFTER={_env_float('STALE_AFTER', 8.0)}s "
         f"MAX_RUN_SECONDS={_env_float('MAX_RUN_SECONDS', 120.0)}s",
     ]
-    if not is_mock():
+    if not is_mock() and hasattr(vision, "cost_cap_usd"):
         lines.append(
             f"  spend cap: ${getattr(vision, 'cost_cap_usd', 0.0):g} for this process"
         )
@@ -778,8 +779,8 @@ def _build_app(env: Optional[dict] = None):
         )
         snap["mock"] = is_mock()
         snap["instance_id"] = instance_id
-        snap["vision_mode"] = "fake" if is_mock() else "http"
-        if isinstance(vision, OmniVision):
+        snap["vision_mode"] = "fake" if is_mock() else ("local" if isinstance(vision, LocalVision) else "http")
+        if hasattr(vision, "estimated_spend_usd"):
             snap["spend"] = {
                 "estimated_usd": round(vision.estimated_spend_usd, 4),
                 "cap_usd": vision.cost_cap_usd,
