@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { RobotConnection } from '../src/services/robotConnection.ts'
+import { typedCommand } from '../src/services/typedCommand.ts'
 
 const settle = () => new Promise(resolve => setImmediate(resolve))
 function fakeApi() {
@@ -88,4 +89,18 @@ test('stop retains active/pending tasks; reconnect never auto resumes', async t 
   await connection.refresh()
   assert.equal(connection.getSnapshot().paused, true)
   assert.equal(api.commands.length, 1)
+})
+
+test('a typed target dispatches through the same path as a spoken one', async t => {
+  const { api, connection } = await setup(t)
+  await connection.accept(typedCommand('the red ball'))
+  assert.equal(api.commands.length, 1)
+  assert.equal(api.commands[0].target, 'the red ball')
+  // And inherits the queueing rather than racing the active command.
+  await connection.accept(typedCommand('the blue flag'))
+  assert.equal(api.commands.length, 1, 'the second waits for arrival')
+  assert.equal(connection.getSnapshot().queue.length, 1)
+  api.finish()
+  await connection.refresh()
+  assert.equal(api.commands[1].target, 'the blue flag')
 })
