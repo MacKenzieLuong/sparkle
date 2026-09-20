@@ -66,8 +66,10 @@ class ControlLoop:
         self._short_interval = _env_float("SHORT_INTERVAL", 1.0)
         self._short_interval_area = _env_float("SHORT_INTERVAL_AREA", 0.15)
         self._control_period = 1.0 / max(_env_float("CONTROL_HZ", 10.0), 0.1)
-        self._stale_factor = _env_float("STALE_FACTOR", 1.5)
-        self._stale_min = _env_float("STALE_MIN", 1.0)
+        # The longest the car may drive on a single box. Deliberately absolute:
+        # scaling it off the measured cycle cut the motors on every slow call,
+        # because a call is only known to be slow once it has already returned.
+        self._stale_after = _env_float("STALE_AFTER", 8.0)
         self._miss_limit = 3
         self._arrive_confirm = int(os.environ.get("ARRIVE_CONFIRM", "2"))
         self._lock = threading.Lock()
@@ -126,22 +128,16 @@ class ControlLoop:
     def snapshot(self) -> dict:
         with self._lock:
             snap = dict(self.state)
-            snap["stale_after"] = round(self._stale_after(), 3)
+            snap["stale_after"] = self._stale_after
+            snap["cycle_time"] = (
+                round(self._cycle_time, 3) if self._cycle_time is not None else None
+            )
             return snap
 
     def _pause(self, area_fraction: Optional[float]) -> float:
         if area_fraction is not None and area_fraction >= self._short_interval_area:
             return self._short_interval
         return self._interval
-
-    def _stale_after(self) -> float:
-        """Seconds a box stays usable. Caller holds the lock.
-
-        Scaled off the measured perception cycle so the deadman catches a hung
-        model call without firing on a cadence the operator chose deliberately.
-        """
-        cycle = self._cycle_time if self._cycle_time is not None else self._interval
-        return max(self._stale_min, self._stale_factor * cycle)
 
     def _owns(self, epoch: int) -> bool:
         """Whether this worker still drives the car. Caller holds the lock."""
@@ -182,6 +178,7 @@ class ControlLoop:
                 if not self._owns(epoch):
                     return
                 if previous_finish is not None:
+                    # Reported for tuning STALE_AFTER; not load-bearing.
                     self._cycle_time = now - previous_finish
                 self.state["cycle"] += 1
                 self.state["error"] = error
@@ -225,7 +222,7 @@ class ControlLoop:
                     return
                 detection = self._latest
                 age = None if self._latest_at is None else now - self._latest_at
-                fresh = age is not None and age <= self._stale_after()
+                fresh = age is not None and age <= self._stale_after
                 self.state["control_cycle"] += 1
                 self.state["detection_age"] = None if age is None else round(age, 3)
 

@@ -169,7 +169,7 @@ def test_steering_outpaces_slow_inference():
         CONTROL_INTERVAL="0",
         SHORT_INTERVAL="0",
         CONTROL_HZ="100",
-        STALE_MIN="5",
+        STALE_AFTER="30",
     ):
         driver = FakeDriver()
         loop = ControlLoop(
@@ -186,14 +186,47 @@ def test_steering_outpaces_slow_inference():
     assert driving != (0.0, 0.0)
 
 
+class JitteryVision(VisionProvider):
+    """Alternates fast and slow replies, like the live model does."""
+
+    def __init__(self, box, delays):
+        self._box = box
+        self._delays = list(delays)
+        self.calls = 0
+
+    def detect(self, target, frame):
+        time.sleep(self._delays[min(self.calls, len(self._delays) - 1)])
+        self.calls += 1
+        return DetectedObject(box_2d=self._box, label=target)
+
+
+def test_a_slow_call_after_fast_ones_does_not_cut_the_motors():
+    """Live latency swung 2.5-4.3s; the window must tolerate that jitter."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_AFTER="1.0",
+    ):
+        driver = FakeDriver()
+        vision = JitteryVision(MOVING_BOX, [0.05, 0.05, 0.05, 0.4, 0.05])
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(lambda: vision.calls >= 5, "loop stalled", timeout=5.0)
+        commands = list(driver.commands)
+        loop.stop()
+
+    # Zeros before the first box are the acquiring phase, not the deadman.
+    driving = next(i for i, c in enumerate(commands) if c != (0.0, 0.0))
+    cuts = [c for c in commands[driving:] if c == (0.0, 0.0)]
+    assert not cuts, f"deadman fired on latency jitter: {len(cuts)} cuts"
+
+
 def test_motors_cut_when_detection_goes_stale():
     with _env(
         MOCK="true",
         CONTROL_INTERVAL="0",
         SHORT_INTERVAL="0",
         CONTROL_HZ="100",
-        STALE_MIN="0.15",
-        STALE_FACTOR="1",
+        STALE_AFTER="0.15",
     ):
         driver = FakeDriver()
         loop = ControlLoop(
@@ -228,7 +261,7 @@ def test_one_spurious_arrival_does_not_end_the_drive():
     """The sequence a live camera produced: a full-frame box between good ones."""
     with _env(
         MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
-        CONTROL_HZ="100", STALE_MIN="5", ARRIVE_CONFIRM="2",
+        CONTROL_HZ="100", STALE_AFTER="30", ARRIVE_CONFIRM="2",
     ):
         driver = FakeDriver()
         vision = ScriptedVision([MOVING_BOX, ARRIVED_BOX, MOVING_BOX, MOVING_BOX])
@@ -248,7 +281,7 @@ def test_one_spurious_arrival_does_not_end_the_drive():
 def test_repeated_arrival_still_ends_the_drive():
     with _env(
         MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
-        CONTROL_HZ="100", STALE_MIN="5", ARRIVE_CONFIRM="2",
+        CONTROL_HZ="100", STALE_AFTER="30", ARRIVE_CONFIRM="2",
     ):
         driver = FakeDriver()
         vision = ScriptedVision([MOVING_BOX, ARRIVED_BOX, ARRIVED_BOX])
@@ -281,7 +314,7 @@ def test_no_motor_writes_after_stop():
         CONTROL_INTERVAL="0",
         SHORT_INTERVAL="0",
         CONTROL_HZ="100",
-        STALE_MIN="5",
+        STALE_AFTER="30",
     ):
         driver = FakeDriver()
         loop = ControlLoop(
@@ -303,7 +336,7 @@ def test_restart_switches_target():
         CONTROL_INTERVAL="0",
         SHORT_INTERVAL="0",
         CONTROL_HZ="100",
-        STALE_MIN="5",
+        STALE_AFTER="30",
     ):
         driver = FakeDriver()
         loop = ControlLoop(

@@ -193,13 +193,21 @@ On `POST /direct`:
    purely a **cost governor** — it no longer limits how often the car steers.
 3. The **control thread** re-steers every `1/CONTROL_HZ` (default 10 Hz) from
    the freshest box, regardless of what perception is doing.
-4. **Staleness deadman.** If the freshest box is older than
-   `max(STALE_MIN, STALE_FACTOR × measured perception cycle)`, the control
-   thread cuts the motors and reports `status="stale"`, leaving navigation
-   running so it resumes the moment a box arrives. The window is scaled off the
-   *measured* cycle so a deliberately slow cadence never trips it, while a hung
-   request trips it within a couple of cycles. `/status` reports the live value
-   as `stale_after`.
+4. **Staleness deadman.** If the freshest box is older than `STALE_AFTER`
+   seconds (default 8), the control thread cuts the motors and reports
+   `status="stale"`, leaving navigation running so it resumes the moment a box
+   arrives.
+
+   The window is deliberately an absolute number rather than a multiple of the
+   measured cycle. Scaling it off the cycle was tried and cut the motors on
+   every slow call: a call is only known to be slow once it has returned, so
+   the box ages past a window sized on the previous, faster cycle while the
+   slow one is still in flight. Live latency swung 2.5–4.3 s call to call,
+   which made that stutter constant.
+
+   Set it from measured latency — `cli.py -n 5` reports the spread — and treat
+   it as *the longest the car may drive on one box*. `/status` reports both
+   `stale_after` and the observed `cycle_time` for tuning.
 5. Exit conditions, both owned by the perception thread so one bad frame
    cannot end a drive:
    - **arrived** — the box covers ≥ `ARRIVED_AREA_FRACTION` of the frame on
@@ -290,8 +298,7 @@ Debug endpoints return `400` when the providers are not fake.
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
 | `SHORT_INTERVAL_AREA` | `0.15` | Box area fraction (of the 1000×1000 frame) that triggers the fast cadence |
 | `CONTROL_HZ` | `10` | Steering updates per second, independent of inference cadence |
-| `STALE_FACTOR` | `1.5` | Motors cut once the freshest box is this many measured perception cycles old |
-| `STALE_MIN` | `1.0` | Floor for the staleness window, in seconds |
+| `STALE_AFTER` | `8.0` | Seconds the car may drive on one box before the motors cut; must exceed your measured latency |
 | `BASE_SPEED` | `0.5` | Forward throttle before area scaling — **lower this for a slow first test** |
 | `TURN_GAIN` | `0.8` | Turn aggressiveness; lower it alongside `BASE_SPEED` |
 | `DEAD_ZONE` | `0.08` | Horizontal offset below which the car drives straight |
