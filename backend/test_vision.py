@@ -55,6 +55,28 @@ def test_out_of_range_coordinates_passthrough():
     assert len(boxes) == 1
 
 
+def test_qwen_bbox_2d_key_is_accepted():
+    """Verbatim reply from qwen3.8-omni-flash, which says bbox_2d."""
+    text = (
+        '```json\n[\n\t{"bbox_2d": [786, 821, 963, 999], "label": "a chair"}\n]\n```'
+    )
+    boxes = _parse_boxes(text)
+    assert len(boxes) == 1
+    assert boxes[0]["box_2d"] == [786, 821, 963, 999]
+    assert boxes[0]["label"] == "a chair"
+
+
+@pytest.mark.parametrize("key", ["box_2d", "bbox_2d", "bbox", "box", "bounding_box"])
+def test_box_key_variants(key):
+    boxes = _parse_boxes(f'[{{"{key}": [1, 2, 3, 4], "label": "x"}}]')
+    assert boxes[0]["box_2d"] == [1, 2, 3, 4]
+
+
+def test_label_absent_leaves_caller_default():
+    boxes = _parse_boxes('[{"bbox_2d": [1, 2, 3, 4]}]')
+    assert boxes[0].get("label", "fallback") == "fallback"
+
+
 def test_cost_cap_defaults_to_one_dollar(monkeypatch):
     monkeypatch.delenv("MAX_COST_USD", raising=False)
     assert OmniVision(api_key="test-key").cost_cap_usd == 1.0

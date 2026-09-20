@@ -178,7 +178,32 @@ def _parse_boxes(text: str) -> List[dict]:
             return []
     if not isinstance(data, list):
         return []
-    return [b for b in data if isinstance(b, dict) and len(b.get("box_2d", [])) == 4]
+
+    boxes = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        coords = _coords_of(entry)
+        if coords is None:
+            continue
+        box = {"box_2d": coords}
+        if "label" in entry:
+            box["label"] = entry["label"]
+        boxes.append(box)
+    return boxes
+
+
+# Qwen answers with "bbox_2d" where Gemini uses "box_2d". Accepting both costs
+# nothing and the alternative is silently discarding every real detection.
+BOX_KEYS = ("box_2d", "bbox_2d", "bbox", "box", "bounding_box")
+
+
+def _coords_of(entry: dict) -> Optional[List]:
+    for key in BOX_KEYS:
+        value = entry.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 4:
+            return list(value)
+    return None
 
 
 def make_vision(scene: Optional[FakeScene] = None) -> VisionProvider:
