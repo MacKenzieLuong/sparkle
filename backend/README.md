@@ -478,8 +478,39 @@ floor with clear space**; on blocks the wheels turn without the body rotating
 and every number is meaningless.
 
 ```sh
-DRIVER=tb6612 CAMERA=rpicam .venv/bin/python calibrate.py
+# the car finds its own numbers, using the camera
+DRIVER=tb6612 CAMERA=rpicam .venv/bin/python calibrate.py --auto
+
+# the rest, which genuinely need a person
+DRIVER=tb6612 CAMERA=rpicam .venv/bin/python calibrate.py --stiction --forward
 ```
+
+### Let the car measure itself
+
+Every constant chosen in advance here has been wrong on contact with the real
+chassis — the pivot throttles, the turn gain, the decay. A loaded car simply
+does not turn at the differentials that seemed reasonable.
+
+So `--auto` does not choose. It sweeps the throttle up from the measured
+breakaway point and watches the scene through the camera, because optical flow
+measures the car's own rotation directly:
+
+```
+    0.20:     12 px/s  consistency 0.31  stalled
+    0.35:     48 px/s  consistency 0.44  creeps
+    0.45:    210 px/s  consistency 0.81  spins
+```
+
+Two numbers per step. **Rate** is how fast the image slides. **Consistency** is
+how rigidly — turning on the spot carries the whole scene together and
+approaches 1, while a car swinging around a stalled wheel also translates, so
+near parts of the scene outrun far ones and it drops. That distinguishes a real
+spin from a swing without anyone having to watch the wheels.
+
+Coast is measured the same way: cut the power and time how long the image takes
+to stop sliding. No compass, no protractor, no presses, and it can be re-run in
+a minute whenever the battery sags or the surface changes — neither of which an
+open-loop constant can follow.
 
 | measured | what it gives |
 | --- | --- |

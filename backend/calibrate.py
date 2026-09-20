@@ -239,6 +239,153 @@ def measure_scale(driver, camera, pivots: dict) -> Optional[dict]:
     }
 
 
+def grey_of(camera) -> np.ndarray:
+    return cv2.cvtColor(camera.read(), cv2.COLOR_BGR2GRAY)
+
+
+def flow_sample(camera, pairs: int = 5) -> Optional[tuple]:
+    """How fast the image is sliding sideways, and how rigidly.
+
+    Rate is pixels per second of horizontal motion. Consistency is how alike
+    the points moved: turning on the spot shifts the whole scene together, so
+    it approaches 1, while a car swinging around a stalled wheel translates as
+    well as rotates and the near parts of the scene outrun the far ones.
+    """
+    rates, spreads = [], []
+    for _ in range(pairs):
+        before = grey_of(camera)
+        started = time.monotonic()
+        points = cv2.goodFeaturesToTrack(before, 150, 0.01, 7)
+        if points is None or len(points) < 15:
+            continue
+        after = grey_of(camera)
+        elapsed = time.monotonic() - started
+        if elapsed <= 0:
+            continue
+        moved, status, _ = cv2.calcOpticalFlowPyrLK(
+            before, after, points, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if moved is None:
+            continue
+        keep = status.reshape(-1) == 1
+        if int(keep.sum()) < 10:
+            continue
+        shifts = (moved.reshape(-1, 2)[keep] - points.reshape(-1, 2)[keep])[:, 0]
+        middle = float(np.median(shifts))
+        rates.append(middle / elapsed)
+        spreads.append(float(np.percentile(np.abs(shifts - middle), 75)))
+    if not rates:
+        return None
+    rate = float(np.median(rates))
+    spread = float(np.median(spreads))
+    consistency = 1.0 / (1.0 + spread / max(1.0, abs(rate) * 0.02))
+    return rate, consistency
+
+
+def auto_pivot(driver, camera, stiction: dict) -> Optional[dict]:
+    """Find the throttle that actually spins the car, by watching the image.
+
+    Every differential in the earlier version was a number picked in advance,
+    and on a loaded chassis the low ones only stall one wheel. So sweep upward
+    from the measured breakaway throttle until the camera says the scene is
+    really rotating, and take the answer from that.
+    """
+    print("\n=== Finding a throttle that actually spins the car ===")
+    print("No presses needed: the camera watches the scene and reports how fast")
+    print("it is turning. Point it at something textured and give it floor space.")
+
+    floor = max(stiction.get("left", 0.0), stiction.get("right", 0.0), 0.1)
+    still = flow_sample(camera, pairs=3)
+    if still is None:
+        print("  not enough features to see motion — aim somewhere more textured")
+        return None
+    noise = abs(still[0])
+    print(f"  stationary noise floor: {noise:.0f} px/s")
+
+    steps = []
+    effective: Optional[float] = None
+    differential = round(floor, 2)
+    while differential <= 1.0:
+        driver.apply(differential, -differential)
+        time.sleep(0.35)  # let it reach a steady rate before measuring
+        sample = flow_sample(camera)
+        driver.stop()
+        time.sleep(0.8)
+        if sample is None:
+            print(f"    {differential:.2f}: lost the scene")
+            differential = round(differential + 0.05, 2)
+            continue
+        rate, consistency = sample
+        spins = abs(rate) > max(4 * noise, 25.0) and consistency > 0.5
+        mark = "spins" if spins else ("creeps" if abs(rate) > 2 * noise else "stalled")
+        print(f"    {differential:.2f}: {abs(rate):6.0f} px/s  "
+              f"consistency {consistency:.2f}  {mark}")
+        steps.append({
+            "differential": differential,
+            "px_per_second": round(abs(rate), 1),
+            "consistency": round(consistency, 3),
+            "spins": spins,
+        })
+        if spins and effective is None:
+            effective = differential
+            # One more above it, to show the response is still climbing.
+            if differential >= 0.95:
+                break
+        elif effective is not None:
+            break
+        differential = round(differential + 0.05, 2)
+
+    driver.stop()
+    if effective is None:
+        print("\n  Nothing up to full throttle turned the car cleanly on the spot.")
+        print("  That is a mechanical or power problem, not a tuning one: check")
+        print("  the battery under load, and that both wheels are free to turn.")
+        return {"steps": steps, "minimum_spin": None}
+
+    print(f"\n  -> spins cleanly from differential {effective:.2f}")
+    print(f"     Use it as the floor for SEARCH_SPEED and for turning.")
+    return {"steps": steps, "minimum_spin": effective, "noise_px_per_second": round(noise, 1)}
+
+
+def auto_coast(driver, camera, differential: float) -> Optional[dict]:
+    """How long rotation takes to die after power is cut, measured by camera."""
+    print("\n=== Coast, measured by camera ===")
+    driver.apply(differential, -differential)
+    time.sleep(1.2)
+    spinning = flow_sample(camera, pairs=3)
+    driver.stop()
+    cut = time.monotonic()
+    if spinning is None:
+        print("  could not see the spin")
+        return None
+
+    samples = []
+    while time.monotonic() - cut < 3.0:
+        sample = flow_sample(camera, pairs=1)
+        if sample is None:
+            break
+        samples.append((time.monotonic() - cut, abs(sample[0])))
+        if abs(sample[0]) < abs(spinning[0]) * 0.1:
+            break
+
+    if not samples:
+        print("  could not follow the slowdown")
+        return None
+    duration = samples[-1][0]
+    # A body slowing to rest sweeps about half its starting rate for the
+    # duration, so this is the coast expressed in pixels of image motion.
+    coast_px = abs(spinning[0]) * duration / 2
+    print(f"  spinning at {abs(spinning[0]):.0f} px/s, stopped after {duration:.2f}s")
+    print(f"  -> coasts about {coast_px:.0f} px of image motion after the cut")
+    return {
+        "spin_px_per_second": round(abs(spinning[0]), 1),
+        "coast_seconds": round(duration, 3),
+        "coast_px": round(coast_px, 1),
+    }
+
+
 def measure_stiction(driver) -> dict:
     """The throttle at which each wheel actually starts turning.
 
@@ -402,6 +549,17 @@ def report(data: dict) -> None:
     if not (scale.get("deg_per_pixel") and pivots):
         print("  Not enough measurements yet to derive turn durations.")
 
+    spin = data.get("spin") or {}
+    if spin.get("minimum_spin"):
+        print(f"\n  The car only turns cleanly on the spot from differential "
+              f"{spin['minimum_spin']:.2f}.")
+        print("  Anything below that stalls a wheel and swings instead, so:")
+        print(f"    export SEARCH_SPEED={spin['minimum_spin']:.2f}")
+        coast = spin.get("coast") or {}
+        if coast.get("coast_px"):
+            print(f"  It coasts ~{coast['coast_px']:.0f} px of image motion after the")
+            print("  cut, which is the overshoot to stop short by.")
+
     trim = data.get("trim") or {}
     stiction = data.get("stiction") or {}
     if trim or stiction:
@@ -431,8 +589,11 @@ def main() -> int:
     parser.add_argument("--forward", action="store_true", help="forward speed only")
     parser.add_argument("--trim", action="store_true", help="straight-line trim only")
     parser.add_argument("--stiction", action="store_true", help="minimum throttle only")
+    parser.add_argument("--auto", action="store_true",
+                        help="let the camera find the spin throttle and coast")
     args = parser.parse_args()
-    chosen = args.pivots or args.scale or args.forward or args.trim or args.stiction
+    chosen = (args.pivots or args.scale or args.forward or args.trim
+              or args.stiction or args.auto)
 
     from drive import make_driver
 
@@ -473,7 +634,25 @@ def main() -> int:
                       f"right={driver.right_min:.2f} for everything below, so both")
                 print("  wheels turn and a pivot is a real pivot.")
 
-        if not chosen or args.pivots or args.scale:
+        if args.auto:
+            from camera import make_camera
+            from scenarios import SCENARIOS
+
+            camera = make_camera(SCENARIOS["center"])
+            try:
+                spin = auto_pivot(driver, camera, data.get("stiction") or {})
+                if spin:
+                    data["spin"] = spin
+                    if spin.get("minimum_spin"):
+                        coast = auto_coast(driver, camera, spin["minimum_spin"])
+                        if coast:
+                            data["spin"]["coast"] = coast
+            finally:
+                release = getattr(camera, "release", None)
+                if release:
+                    release()
+
+        if (not chosen or args.pivots or args.scale) and not args.auto:
             pivots = measure_pivots(driver)
             if pivots:
                 data["pivots"] = pivots
