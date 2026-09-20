@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { startRecording } from '../services/audioCapture'
 import type { Recording } from '../services/audioCapture'
 import { interpretAudio } from '../services/robotApi'
+import { randomId } from '../services/randomId'
 import type { Capabilities, VoiceResult } from '../types/api'
 
 type Phase = 'idle' | 'requesting' | 'listening' | 'processing'
@@ -33,7 +34,7 @@ export function VoiceControl({ connected, capabilities, onResult }: {
     changePhase('processing')
     setFeedback('Processing command…')
     try {
-      const result = await interpretAudio(audio, crypto.randomUUID())
+      const result = await interpretAudio(audio, randomId())
       if (current !== token.current) return
       console.log('Voice interpretation', {
         requestId: result.requestId,

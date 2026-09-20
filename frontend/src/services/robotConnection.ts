@@ -1,4 +1,5 @@
 import type { Capabilities, RobotApi, Status, VoiceResult } from '../types/api'
+import { randomId } from './randomId.ts'
 import type { LogEntry, Task } from '../types/robot'
 
 export type ConnectionView = {
@@ -8,7 +9,7 @@ export type ConnectionView = {
 const failedStates = new Set(['target_lost', 'error', 'connection_lost', 'stopped', 'halted', 'time_limit'])
 export class RobotConnection {
   private api: RobotApi
-  private sessionId = crypto.randomUUID()
+  private sessionId = randomId()
   private snapshot: Status | null = null
   private view: ConnectionView = { active: null, queue: [], logs: [], connected: false, paused: false, ready: false, status: 'idle', message: '', capabilities: null }
   private listeners = new Set<() => void>()
@@ -57,7 +58,7 @@ export class RobotConnection {
       }
       if (!this.enabled) return
       if (!previous && snapshot.target && snapshot.running) {
-        this.update({ active: { id: snapshot.command_id ?? crypto.randomUUID(), target: snapshot.target }, paused: snapshot.session_id !== this.sessionId })
+        this.update({ active: { id: snapshot.command_id ?? randomId(), target: snapshot.target }, paused: snapshot.session_id !== this.sessionId })
       }
       if (!previous || previous.status !== snapshot.status || previous.command_id !== snapshot.command_id) this.log(`${snapshot.status}${snapshot.target ? ` → ${snapshot.target}` : ''}`)
       if (this.unknown && this.view.active) {
@@ -117,7 +118,7 @@ export class RobotConnection {
     if (this.seenVoice.size > 200) this.seenVoice.delete(this.seenVoice.values().next().value!)
     if (result.intent === 'reject') return
     if (result.intent === 'navigate' && result.target) {
-      this.update({ queue: [...this.view.queue, { id: crypto.randomUUID(), target: result.target }] })
+      this.update({ queue: [...this.view.queue, { id: randomId(), target: result.target }] })
       this.log(`Queued → ${result.target}`)
       // Poll serially so each dispatch uses a freshly observed revision.
       await this.refresh()
@@ -139,7 +140,7 @@ export class RobotConnection {
         if (this.snapshot.session_id !== this.sessionId) throw new Error('Another session is active. Wait for it to stop.')
         this.update({ paused: false, message: 'Navigation resumed.' }); return
       }
-      if (this.view.active) await this.send({ ...this.view.active, id: crypto.randomUUID() }, true)
+      if (this.view.active) await this.send({ ...this.view.active, id: randomId() }, true)
       else if (this.view.queue.length) await this.dispatchNext(true)
       else { await this.api.resume(this.snapshot.revision); this.update({ paused: false, message: 'Queue is empty. Ready for a new target.' }) }
     }
