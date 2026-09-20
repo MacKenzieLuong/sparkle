@@ -77,6 +77,11 @@ setting TURN_LEAD 0
 # A pivoting car keeps rotating after the command stops, so call it centred
 # sooner than a wheeled robot would. Raise further if it still overshoots.
 setting DEAD_ZONE 0.15
+# Stop when the target's box covers this share of the frame -- about half
+# the frame width for a square target. Well short of touching it, because
+# approach speed barely falls as the target grows (the stiction minimum is
+# most of the throttle) so the car arrives fast, stops dead, then coasts.
+setting ARRIVED_AREA_FRACTION 0.25
 # The in-place scan pivot. Floored by the stiction minimums below: as this
 # approaches 0 the wheels still get MOTOR_*_MIN, because under that they do
 # not turn at all. 0.05 is about as slow as this chassis pivots.
