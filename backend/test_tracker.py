@@ -81,6 +81,44 @@ def test_box_grows_as_the_target_approaches():
     assert (xmax - xmin) > (original[3] - original[1]), "box should grow"
 
 
+def test_gives_up_once_the_box_wanders_too_far():
+    """The observed failure: points drift onto background and the car chases it.
+
+    Surviving-point count stays high the whole time, so only a bound on how far
+    the box may travel from where the model put it catches this.
+    """
+    tracker = BoxTracker()
+    assert tracker.seed(scene(), box_around()) is True
+
+    lost_at = None
+    for step in range(6, 200, 6):
+        result = tracker.update(scene(shift_x=step))
+        if result is None:
+            lost_at = step
+            break
+    assert lost_at is not None, "tracker followed the target forever without confirming"
+    assert lost_at > 20, f"gave up far too eagerly, at {lost_at}px"
+
+
+def test_gives_up_when_the_box_leaves_the_frame():
+    tracker = BoxTracker()
+    # Seeded near the right edge, then pushed off it.
+    start = to_normalised(WIDTH - 90, 100, WIDTH - 10, 180, WIDTH, HEIGHT)
+    frame = scene()
+    cv2.rectangle(frame, (WIDTH - 90, 100), (WIDTH - 10, 180), 200, -1)
+    for offset in range(WIDTH - 86, WIDTH - 12, 6):
+        cv2.line(frame, (offset, 104), (offset, 176), 40, 2)
+    assert tracker.seed(frame, start) is True
+
+    for _ in range(12):
+        shifted = np.roll(frame, 20, axis=1)
+        frame = shifted
+        if tracker.update(frame) is None:
+            break
+    else:
+        pytest.fail("kept tracking a box that had left the frame")
+
+
 def test_update_without_seed_returns_none():
     assert BoxTracker().update(scene()) is None
 

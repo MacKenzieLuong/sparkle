@@ -91,6 +91,10 @@ class ControlLoop:
             "1", "true", "yes",
         )
         self._track_min_confidence = _env_float("TRACK_MIN_CONFIDENCE", 0.4)
+        # How long a seed may be followed before the model has to confirm the
+        # target again. Flow cannot tell you the target is gone, so without a
+        # horizon the car drives at whatever the points drifted onto.
+        self._track_max_age = _env_float("TRACK_MAX_AGE", 1.5)
         # Last resort: if the network drops, /stop is unreachable and nothing
         # else bounds a drive that never arrives.
         self._max_run_seconds = _env_float("MAX_RUN_SECONDS", 120.0)
@@ -396,7 +400,16 @@ class ControlLoop:
                     return
                 # Prefer the tracked box: same decision, but current rather
                 # than seconds old, so the turn is still the right turn.
-                if self._tracked is not None and self._tracked_at is not None:
+                seed_age = (
+                    None if self._tracked_seed is None else now - self._tracked_seed
+                )
+                trackable = (
+                    self._tracked is not None
+                    and self._tracked_at is not None
+                    and seed_age is not None
+                    and seed_age <= self._track_max_age
+                )
+                if trackable:
                     detection, source_at = self._tracked, self._tracked_at
                 else:
                     detection, source_at = self._latest, self._latest_at

@@ -46,22 +46,30 @@ setting VISION_EXPLAIN false
 # and it costs ~2% of one core rather than a multiple of the API bill.
 setting TRACK true
 setting TRACK_HZ 20
+# Flow cannot report that a target has gone, so a seed is only followed for
+# this long before the model has to confirm the target is still there.
+setting TRACK_MAX_AGE 1.5
 # With tracking doing the reacting, one request in flight is enough: the model
 # only has to confirm the target and correct drift. Raise for faster
 # confirmation at proportionally higher spend.
-setting VISION_CONCURRENCY 1
+# Two in flight: the model confirms roughly every 1.7s instead of 3.4s, which
+# halves how long the car can chase something no longer there. Costs 2x.
+setting VISION_CONCURRENCY 2
 setting VISION_STAGGER 1.2
 
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
 setting BASE_SPEED 0.2
 setting TURN_GAIN 0.3
+# A pivoting car keeps rotating after the command stops, so call it centred
+# sooner than a wheeled robot would. Raise further if it still overshoots.
+setting DEAD_ZONE 0.15
 setting SEARCH_SPEED 0.25
 
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows
 setting CONTROL_HZ 10
-setting STALE_AFTER 8           # max seconds driving on one decision
+setting STALE_AFTER 5           # max seconds driving on one decision
 setting MAX_RUN_SECONDS 120     # backstop if /stop is unreachable
 setting MAX_COST_USD 0.25
 

@@ -140,8 +140,17 @@ a mocked 3s model:
 That costs 0.83 ms per frame — under 2% of one core at 20 Hz — against a
 640x480 JPEG decode at 2.75 ms which the camera read already pays.
 
-Tracking is only ever a bridge, and it is treated as one:
+Tracking is only ever a bridge, and it is treated as one. Optical flow cannot
+tell you a target has *gone* — points that drift onto the background keep
+tracking beautifully, and a confident, centred box the car drives at is exactly
+what that looks like from the outside. It was observed on the floor: the car
+turned past the target and kept going, steering at scenery. So:
 
+- a seed is followed for at most `TRACK_MAX_AGE`, after which the model must
+  confirm the target again — the only check that catches background-following,
+  since surviving-point count stays high throughout
+- the box may not wander more than `TRACK_MAX_DRIFT` of the frame from where
+  the model put it, nor end up mostly outside the frame
 - every new detection re-seeds it, so drift never accumulates across replies
 - each update reports confidence from surviving points and a forward-backward
   error check; below `TRACK_MIN_CONFIDENCE` it reports failure instead of a
@@ -409,6 +418,8 @@ Debug endpoints return `400` when the providers are not fake.
 | `TRACK` | `true` | Follow the box locally between model replies |
 | `TRACK_HZ` | `20` | Tracker update rate |
 | `TRACK_MIN_CONFIDENCE` | `0.4` | Surviving-point fraction below which tracking reports failure |
+| `TRACK_MAX_AGE` | `1.5` | Seconds a seed may be followed before the model must re-confirm |
+| `TRACK_MAX_DRIFT` | `0.30` | Fraction of the frame the box may wander from its seed |
 | `TRACK_POINTS` | `80` | Features seeded inside each new box |
 | `TRACK_FB_TOLERANCE` | `2.0` | Pixels of forward-backward error a point may have and still count |
 | `MAX_COST_USD` | `1.00` | Estimated spend cap for the process; `0` disables it |

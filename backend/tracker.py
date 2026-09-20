@@ -20,10 +20,13 @@ import numpy as np
 
 Box2D = Tuple[int, int, int, int]  # ymin, xmin, ymax, xmax, normalised 0-1000
 
+# A pivoting car moves the whole scene a long way between frames. Too small a
+# window or too shallow a pyramid loses the target mid-turn, the box lags
+# behind it, and the controller keeps turning into an overshoot.
 LK_PARAMS = dict(
-    winSize=(15, 15),
-    maxLevel=2,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+    winSize=(21, 21),
+    maxLevel=3,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
 )
 
 
@@ -59,10 +62,16 @@ class BoxTracker:
         # A point whose round trip lands far from where it started was not
         # really tracked; this is the standard forward-backward sanity check.
         self.fb_tolerance = _env_float("TRACK_FB_TOLERANCE", 2.0)
+        # How far the box may wander from where the model put it before the
+        # tracker is no longer believed. Points that drift onto the background
+        # keep tracking perfectly well, so surviving-point count alone cannot
+        # tell "still on the target" from "following the wall behind it".
+        self.max_drift = _env_float("TRACK_MAX_DRIFT", 0.30)
         self._previous: Optional[np.ndarray] = None
         self._points: Optional[np.ndarray] = None
         self._seeded_count = 0
         self._box: Optional[Tuple[float, float, float, float]] = None
+        self._seed_centre: Optional[Tuple[float, float]] = None
 
     @property
     def tracking(self) -> bool:
@@ -73,6 +82,7 @@ class BoxTracker:
         self._points = None
         self._seeded_count = 0
         self._box = None
+        self._seed_centre = None
 
     def seed(self, grey: np.ndarray, box: Box2D) -> bool:
         """Anchor to a fresh box from the model. True if it found features."""
@@ -95,6 +105,7 @@ class BoxTracker:
         self._points = points
         self._seeded_count = len(points)
         self._box = (x1, y1, x2, y2)
+        self._seed_centre = ((x1 + x2) / 2, (y1 + y2) / 2)
         return True
 
     def update(self, grey: np.ndarray) -> Optional[Tuple[Box2D, float]]:
@@ -146,5 +157,26 @@ class BoxTracker:
         self._points = after.reshape(-1, 1, 2)
 
         height, width = grey.shape[:2]
+
+        # Give up once the box has wandered too far from where the model put
+        # it. Without this the tracker follows the background right off the
+        # target and keeps reporting a confident box the car drives at.
+        if self._seed_centre is not None:
+            drifted = np.hypot(
+                (centre_x - self._seed_centre[0]) / width,
+                (centre_y - self._seed_centre[1]) / height,
+            )
+            if drifted > self.max_drift:
+                self.reset()
+                return None
+
+        # A box mostly outside the frame is not something to steer at.
+        visible_x = max(0.0, min(width, self._box[2]) - max(0.0, self._box[0]))
+        visible_y = max(0.0, min(height, self._box[3]) - max(0.0, self._box[1]))
+        area = max(1e-6, (self._box[2] - self._box[0]) * (self._box[3] - self._box[1]))
+        if (visible_x * visible_y) / area < 0.5:
+            self.reset()
+            return None
+
         confidence = float(keep.sum()) / max(1, self._seeded_count)
         return to_normalised(*self._box, width, height), confidence

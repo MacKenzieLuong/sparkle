@@ -468,6 +468,36 @@ def test_tracking_keeps_the_steering_box_current():
     assert snap["model_age"] > snap["detection_age"], "model box should be the older one"
 
 
+def test_tracking_is_not_trusted_past_its_horizon():
+    """The failure seen on the floor: it kept driving at a box nothing confirmed.
+
+    Flow cannot report that a target has gone, so a seed is only followed for
+    TRACK_MAX_AGE before the model has to say the target is still there.
+    """
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="30", TRACK="true", TRACK_HZ="30", TRACK_MAX_AGE="0.3",
+    ):
+        loop = ControlLoop(
+            TrackableCamera(FakeScene(boxes=[])),
+            SlowVision((330, 220, 670, 470), 2.0),  # one slow reply, then silence
+            FakeDriver(),
+        )
+        loop.start("a chair")
+        _wait_until(
+            lambda: loop.snapshot()["detection_age"] is not None, "never steered",
+            timeout=5.0,
+        )
+        time.sleep(0.6)  # past the 0.3s horizon, still inside the 2s model call
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["detection_age"] >= 0.3, (
+        "still steering on a tracked box past its horizon: "
+        f"age {snap['detection_age']}s"
+    )
+
+
 def test_control_falls_back_to_the_model_box_when_tracking_is_off():
     with _env(
         MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
