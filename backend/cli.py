@@ -72,11 +72,35 @@ def test_motors(step_seconds: float) -> int:
     Direction and left/right mapping are physical facts no test can assert, so
     this prints what should happen and lets you watch whether it does.
     """
+    import os
+
     from drive import make_driver
 
     driver = make_driver()
-    print(f"Driver: {type(driver).__name__}")
-    print("PUT THE CAR ON BLOCKS — wheels will turn. Ctrl-C to abort.")
+    print(f"DRIVER env: {os.environ.get('DRIVER', 'fake (default)')}")
+    print(f"Driver:     {type(driver).__name__}")
+    if type(driver).__name__ == "FakeDriver":
+        print("\nThis is the FAKE driver — nothing will move.")
+        print("Re-run with DRIVER=tb6612 to drive real motors.")
+        return 2
+
+    pins = getattr(driver, "pins", None)
+    if pins:
+        print("Pins (BCM):", ", ".join(f"{k}={v}" for k, v in pins.items()))
+    try:
+        from gpiozero import Device
+
+        Device.ensure_pin_factory()
+        print(f"gpiozero pin factory: {type(Device.pin_factory).__name__}")
+    except Exception as exc:
+        print(f"gpiozero pin factory unavailable: {exc}")
+
+    print("\nIf nothing moves at all, check in this order:")
+    print("  1. motor supply (VM) connected and switched on — logic power is")
+    print("     separate, so the Pi can look fine while the motors have none")
+    print("  2. STBY wired to the pin above; the TB6612 coasts when it is low")
+    print("  3. motor leads seated in the A/B screw terminals")
+    print("\nPUT THE CAR ON BLOCKS — wheels will turn. Ctrl-C to abort.")
     for count in (3, 2, 1):
         print(f"  {count}...", flush=True)
         time.sleep(1)

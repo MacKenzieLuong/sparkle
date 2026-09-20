@@ -41,6 +41,11 @@ class TB6612Driver(Driver):
     ):
         from gpiozero import DigitalOutputDevice, Motor
 
+        self.pins = {
+            "left_forward": ain2, "left_reverse": ain1, "left_pwm": pwma,
+            "right_forward": bin1, "right_reverse": bin2, "right_pwm": pwmb,
+            "stby": stby,
+        }
         self._stby = DigitalOutputDevice(stby, initial_value=True)
         # Matches the verified GPIO test: A forward is GPIO 27 (AIN2),
         # and B forward is GPIO 16 (BIN1).

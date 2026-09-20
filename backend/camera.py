@@ -16,9 +16,17 @@ import numpy as np
 from scenarios import FakeScene
 
 
+ROTATIONS = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
 class CameraProvider:
     def __init__(self):
         self._frame_no = 0
+        self._rotation = int(os.environ.get("CAMERA_ROTATION", "0")) % 360
 
     @property
     def frame_no(self) -> int:
@@ -29,6 +37,10 @@ class CameraProvider:
 
     def _tag_frame(self, frame: np.ndarray) -> np.ndarray:
         self._frame_no += 1
+        # Applied here so it covers every provider, and so the model, the
+        # preview and the steering math all agree on which way is up.
+        if self._rotation in ROTATIONS:
+            frame = cv2.rotate(frame, ROTATIONS[self._rotation])
         return frame
 
 

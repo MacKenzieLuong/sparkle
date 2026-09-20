@@ -329,6 +329,7 @@ Debug endpoints return `400` when the providers are not fake.
 | `VISION_INPUT_USD_PER_MILLION` | `0.55` | Image-token input rate used by the estimate |
 | `VISION_OUTPUT_USD_PER_MILLION` | `2.20` | Output-token rate used by the estimate |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | Frame resolution |
+| `CAMERA_ROTATION` | `0` | Rotate every frame `90`/`180`/`270` — for a camera mounted upside down |
 | `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far; `0` polls as fast as model latency allows |
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
 | `SHORT_INTERVAL_AREA` | `0.15` | Box area fraction (of the 1000×1000 frame) that triggers the fast cadence |
@@ -385,6 +386,9 @@ else holds it — libcamera reports a camera in use exactly like an absent one.
 ```sh
 DRIVER=tb6612 .venv/bin/python cli.py --test-motors
 ```
+It first prints the resolved pins and the gpiozero pin factory, then refuses to
+run at all under the fake driver, so "nothing moved" can never be a silent
+no-op.
 Each step names a wheel and a direction; watch that the right wheel turns the
 right way. Wrong direction → swap that motor's two direction pins. Wrong wheel
 → swap the A and B groups.

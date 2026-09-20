@@ -2,6 +2,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import pytest
 
 from camera import EOI, SOI, FakeCamera, RpiCamCamera, newest_jpeg
@@ -47,6 +48,36 @@ def test_frame_no_increments():
     cam.read()
     cam.read()
     assert cam.frame_no == 3
+
+
+def _corner_marked_camera(monkeypatch, rotation):
+    """A camera whose frames carry a bright mark in the top-left corner."""
+    monkeypatch.setenv("CAMERA_ROTATION", str(rotation))
+
+    class Marked(FakeCamera):
+        def read(self):
+            frame = np.zeros((40, 60, 3), dtype=np.uint8)
+            frame[0:10, 0:10] = 255
+            return self._tag_frame(frame)
+
+    return Marked(FakeScene(boxes=[]))
+
+
+def test_rotation_180_moves_the_mark_to_the_opposite_corner(monkeypatch):
+    frame = _corner_marked_camera(monkeypatch, 180).read()
+    assert frame[-1, -1].max() == 255, "mark should land bottom-right"
+    assert frame[0, 0].max() == 0
+    assert frame.shape == (40, 60, 3), "180 keeps the dimensions"
+
+
+def test_rotation_zero_leaves_the_frame_alone(monkeypatch):
+    frame = _corner_marked_camera(monkeypatch, 0).read()
+    assert frame[0, 0].max() == 255
+
+
+def test_rotation_90_swaps_dimensions(monkeypatch):
+    frame = _corner_marked_camera(monkeypatch, 90).read()
+    assert frame.shape == (60, 40, 3)
 
 
 def test_newest_jpeg_discards_backlog():
