@@ -915,7 +915,19 @@ def _build_app(env: Optional[dict] = None):
                 snap = loop.snapshot()
                 infer = snap.get("infer") or {}
                 infer_no = infer.get("frame_no")
-                box = infer.get("box_2d")
+                # Draw the box the car is actually steering on. With tracking
+                # running that is tens of milliseconds old; the model's own box
+                # describes a frame from a whole round trip ago, so drawing it
+                # over a live feed puts the overlay two or three decisions
+                # behind what the camera is showing. The stale one is still
+                # drawn, dimly, because the gap between the two is the clearest
+                # picture of what the tracker is doing.
+                command = snap.get("last_command") or {}
+                steered = command.get("box_2d")
+                box = steered if steered is not None else infer.get("box_2d")
+                shown_age = snap.get("detection_age") if steered is not None \
+                    else snap.get("model_age")
+                stale = infer.get("box_2d")
 
                 cv2.putText(
                     frame,
@@ -950,16 +962,27 @@ def _build_app(env: Optional[dict] = None):
                         1,
                         cv2.LINE_AA,
                     )
+                def _corners(value):
+                    ymin, xmin, ymax, xmax = [int(v) for v in value]
+                    return (int(xmin / 1000 * w), int(ymin / 1000 * h),
+                            int(xmax / 1000 * w), int(ymax / 1000 * h))
+
+                if stale is not None and box is not None and list(stale) != list(box):
+                    sx1, sy1, sx2, sy2 = _corners(stale)
+                    cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), (120, 120, 120), 1)
+                    cv2.putText(
+                        frame, "model", (sx1 + 4, sy2 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA,
+                    )
                 if box is not None:
-                    ymin, xmin, ymax, xmax = [int(v) for v in box]
-                    x1 = int(xmin / 1000 * w)
-                    y1 = int(ymin / 1000 * h)
-                    x2 = int(xmax / 1000 * w)
-                    y2 = int(ymax / 1000 * h)
+                    x1, y1, x2, y2 = _corners(box)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = str(infer.get("label") or "?")
+                    if shown_age is not None:
+                        label += f"  {shown_age:.2f}s old"
                     cv2.putText(
                         frame,
-                        str(infer.get("label") or "?"),
+                        label,
                         (x1 + 6, y1 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
