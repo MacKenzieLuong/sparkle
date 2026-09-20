@@ -19,7 +19,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from camera import make_camera
+from camera import describe_cameras, make_camera
 from controller import command
 from scenarios import SCENARIOS
 from vision import is_mock, make_vision
@@ -58,7 +58,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="One-shot object detection against the configured vision model."
     )
-    parser.add_argument("target", help='what to look for, e.g. "the red ball"')
+    parser.add_argument(
+        "target", nargs="?", help='what to look for, e.g. "the red ball"'
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="report available cameras and anything holding them, then exit",
+    )
     parser.add_argument("--image", help="detect against this file instead of the camera")
     parser.add_argument("-n", "--repeat", type=int, default=1, help="number of looks")
     parser.add_argument(
@@ -67,6 +74,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--save", help="write annotated frames to SAVE-1.jpg, ...")
     parser.add_argument("--raw", action="store_true", help="print the model's raw reply")
     args = parser.parse_args(argv)
+
+    if args.list_cameras:
+        print(describe_cameras())
+        return 0
+    if not args.target:
+        parser.error("target is required (or pass --list-cameras)")
 
     if args.image is not None:
         frame = cv2.imread(args.image)

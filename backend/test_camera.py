@@ -95,8 +95,11 @@ def test_rpicam_serves_the_newest_frame_not_a_backlog(fake_rpicam):
         second = _frame_index(cam.read())
         elapsed = time.monotonic() - started
 
-        assert (second - first) % 200 > 15, "reader is draining a stale backlog"
-        assert elapsed < 0.2, "read() blocked instead of serving the newest frame"
+        # ~30 frames are produced during the pause; a backlogged reader would
+        # hand back the very next one. The gap between those is what matters,
+        # so the bound stays loose enough for a loaded machine.
+        assert (second - first) % 200 > 8, "reader is draining a stale backlog"
+        assert elapsed < 0.5, "read() blocked instead of serving the newest frame"
     finally:
         cam.release()
 

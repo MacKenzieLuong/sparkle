@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import os
 import subprocess
 import sys
@@ -85,7 +86,13 @@ class RpiCamCamera(CameraProvider):
     where it used to be.
     """
 
-    def __init__(self, width: int = 640, height: int = 480, framerate: int = 30):
+    def __init__(
+        self,
+        width: int = 640,
+        height: int = 480,
+        framerate: int = 30,
+        camera_num: Optional[int] = None,
+    ):
         super().__init__()
         self._lock = threading.Lock()
         self._latest: Optional[bytes] = None
@@ -96,6 +103,8 @@ class RpiCamCamera(CameraProvider):
             "--width", str(width), "--height", str(height),
             "--framerate", str(framerate), "--nopreview", "-o", "-",
         ]
+        if camera_num is not None:
+            self._command[1:1] = ["--camera", str(camera_num)]
         # stderr goes to a file, not a pipe: nothing drains a pipe here, and a
         # full one would wedge the camera. Without it a failure is unreadable.
         self._log = tempfile.TemporaryFile()
@@ -130,6 +139,13 @@ class RpiCamCamera(CameraProvider):
         if not output:
             return f"{head} (no stderr). Reproduce with: {' '.join(self._command)}"
         tail = " | ".join(line.strip() for line in output.splitlines()[-4:])
+        if "no cameras available" in output.lower():
+            # libcamera reports a camera another process already holds the same
+            # way it reports one that is not plugged in at all.
+            tail += (
+                " -- this also means 'already in use': check `pgrep -af rpicam`"
+                " for another stream holding it"
+            )
         return f"{head}: {tail}"
 
     def _drain(self) -> None:
@@ -277,6 +293,59 @@ class FakeCamera(CameraProvider):
             return self._tag_frame(frame)
 
 
+def describe_cameras() -> str:
+    """What this machine can capture from, and what might be holding it."""
+    lines = []
+
+    lines.append("CSI (rpicam):")
+    try:
+        result = subprocess.run(
+            ["rpicam-hello", "--list-cameras"],
+            capture_output=True, text=True, timeout=15,
+        )
+        output = (result.stdout + result.stderr).strip()
+        lines += [f"  {line}" for line in output.splitlines()] or ["  (no output)"]
+    except FileNotFoundError:
+        lines.append("  rpicam-hello not installed")
+    except subprocess.TimeoutExpired:
+        lines.append("  rpicam-hello timed out")
+
+    lines.append("")
+    lines.append("V4L2 nodes (/dev/video*):")
+    nodes = sorted(
+        glob.glob("/sys/class/video4linux/video*"),
+        key=lambda p: int(p.rsplit("video", 1)[-1]),
+    )
+    if not nodes:
+        lines.append("  none")
+    for path in nodes:
+        index = path.rsplit("video", 1)[-1]
+        try:
+            with open(os.path.join(path, "name")) as handle:
+                name = handle.read().strip()
+        except OSError:
+            name = "?"
+        lines.append(f"  /dev/video{index:<3} {name}")
+    lines.append("  (pispbe / rpivid / codec entries are ISP nodes, not cameras)")
+
+    lines.append("")
+    lines.append("Processes that may hold a camera:")
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "rpicam|libcamera|ffmpeg"],
+            capture_output=True, text=True, timeout=10,
+        )
+        holders = [
+            line for line in result.stdout.splitlines()
+            if "rpicam-hello --list-cameras" not in line and "pgrep" not in line
+        ]
+        lines += [f"  {line}" for line in holders] or ["  none"]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        lines.append("  (pgrep unavailable)")
+
+    return "\n".join(lines)
+
+
 def make_camera(scene: FakeScene) -> CameraProvider:
     provider = os.environ.get("CAMERA", "fake").lower()
     width = int(os.environ.get("CAMERA_WIDTH", "640"))
@@ -284,10 +353,12 @@ def make_camera(scene: FakeScene) -> CameraProvider:
     if provider == "picamera2":
         return PiCamera(width=width, height=height)
     if provider in ("rpicam", "rpicam-vid"):
+        camera_num = os.environ.get("CAMERA_NUM")
         return RpiCamCamera(
             width=width,
             height=height,
             framerate=int(os.environ.get("CAMERA_FRAMERATE", "30")),
+            camera_num=int(camera_num) if camera_num else None,
         )
     if provider in ("webcam", "usb", "v4l2"):
         index = int(os.environ.get("CAMERA_INDEX", "0"))
