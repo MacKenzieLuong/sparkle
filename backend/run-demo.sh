@@ -12,23 +12,46 @@ cd "$(dirname "$0")"
 
 : "${HUAWEI_API_KEY:?set HUAWEI_API_KEY first (and rotate it if it has ever been pasted anywhere)}"
 
+# Values already in the environment win, so a dry run is just
+# DRIVER=fake ./run-demo.sh. The catch is that an export left over from an
+# earlier step wins in exactly the same silent way — a stale DRIVER=fake once
+# cost a whole demo — so anything inherited gets named before we start.
+inherited=()
+setting() {
+    local name="$1" default="$2"
+    if [ -n "${!name:-}" ]; then
+        inherited+=("$name=${!name}")
+    else
+        export "$name=$default"
+    fi
+}
+
 # --- what is real -----------------------------------------------------------
-export MOCK="${MOCK:-false}"
-export CAMERA="${CAMERA:-rpicam}"
-export CAMERA_ROTATION="${CAMERA_ROTATION:-180}"
-export DRIVER="${DRIVER:-tb6612}"
+setting MOCK false
+setting CAMERA rpicam
+setting CAMERA_ROTATION 180
+setting DRIVER tb6612
 
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
-export BASE_SPEED="${BASE_SPEED:-0.2}"
-export TURN_GAIN="${TURN_GAIN:-0.3}"
-export SEARCH_SPEED="${SEARCH_SPEED:-0.25}"
+setting BASE_SPEED 0.2
+setting TURN_GAIN 0.3
+setting SEARCH_SPEED 0.25
 
 # --- pacing and limits ------------------------------------------------------
-export CONTROL_INTERVAL="${CONTROL_INTERVAL:-0}"   # poll as fast as latency allows
-export CONTROL_HZ="${CONTROL_HZ:-10}"
-export STALE_AFTER="${STALE_AFTER:-8}"             # max seconds driving on one decision
-export MAX_RUN_SECONDS="${MAX_RUN_SECONDS:-120}"   # backstop if /stop is unreachable
-export MAX_COST_USD="${MAX_COST_USD:-0.25}"
+setting CONTROL_INTERVAL 0      # poll as fast as latency allows
+setting CONTROL_HZ 10
+setting STALE_AFTER 8           # max seconds driving on one decision
+setting MAX_RUN_SECONDS 120     # backstop if /stop is unreachable
+setting MAX_COST_USD 0.25
+
+if [ ${#inherited[@]} -gt 0 ]; then
+    echo
+    echo "Using these from your shell instead of the demo defaults:"
+    for pair in "${inherited[@]}"; do
+        echo "    $pair"
+    done
+    echo "  (unset them for the standard live configuration)"
+fi
 
 exec .venv/bin/python server.py
