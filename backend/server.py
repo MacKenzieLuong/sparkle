@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import controller
 from camera import CameraProvider, FakeCamera, make_camera
-from controller import act, command
+from controller import act, command, turn_authority
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
 from vision import (
@@ -282,7 +282,8 @@ class ControlLoop:
                 self.state["detection_age"] = None if age is None else round(age, 3)
 
             if detection is not None and fresh:
-                cmd = act(detection.action, detection.box_2d)
+                authority = turn_authority(age or 0.0)
+                cmd = act(detection.action, detection.box_2d, authority)
                 self._driver.apply(cmd.left, cmd.right)
                 with self._lock:
                     if not self._owns(epoch):
@@ -296,6 +297,7 @@ class ControlLoop:
                         "label": detection.label,
                         "action": detection.action,
                         "reason": detection.reason,
+                        "turn_authority": round(authority, 3),
                         "box_2d": list(detection.box_2d) if detection.box_2d else None,
                         "area_fraction": round(cmd.area_fraction, 3),
                     }

@@ -119,6 +119,33 @@ def test_turn_gain_is_configurable():
     assert 0 < gentle < (reference.left - reference.right)
 
 
+def test_turn_authority_fades_with_age():
+    from controller import TURN_DECAY, turn_authority
+
+    assert turn_authority(0.0) == 1.0
+    assert turn_authority(TURN_DECAY / 2) == pytest.approx(0.5)
+    assert turn_authority(TURN_DECAY) == 0.0
+    assert turn_authority(TURN_DECAY * 10) == 0.0, "never negative"
+
+
+def test_stale_decision_stops_turning_but_keeps_driving():
+    """The overshoot fix: hold the turn briefly, then coast straight."""
+    off_centre = (300, 750, 700, 950)
+    fresh = command(off_centre, turn_scale=1.0)
+    faded = command(off_centre, turn_scale=0.0)
+
+    assert fresh.left != fresh.right, "a fresh decision still turns"
+    assert faded.left == pytest.approx(faded.right), "a faded one drives straight"
+    assert faded.left > 0, "and keeps moving forward"
+
+
+def test_search_scan_also_fades():
+    assert act("search_left", None, 0.0).left == 0.0
+    partial = act("search_left", None, 0.5)
+    full = act("search_left", None, 1.0)
+    assert abs(partial.right) == pytest.approx(abs(full.right) / 2)
+
+
 def test_search_actions_rotate_in_place():
     left = act("search_left", None)
     right = act("search_right", None)

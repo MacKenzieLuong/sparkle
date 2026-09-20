@@ -278,6 +278,27 @@ accordingly.
   `area_fraction ≥ ARRIVED_AREA_FRACTION` → `status="arrived"`, throttles `0`.
 - `box_2d=None` → `status="target_lost"`, both throttles `0`.
 
+### Why the car weaves, and the fade that fixes it
+
+The car acts on one decision until the next arrives seconds later. Holding a
+turn for all of it keeps rotating long after the car already points at the
+target, so it sails past and corrects back — weaving, at a rate no amount of
+`TURN_GAIN` tuning fixes, because the problem is dead time rather than gain.
+
+Turn authority therefore fades to zero over `TURN_DECAY` seconds. Forward
+motion is untouched; only rotation fades:
+
+```
+ age   authority   left   right
+ 0.0s     1.00   +0.89  -0.05     turn hard, having just seen the target
+ 0.6s     0.50   +0.66  +0.18
+ 1.2s     0.00   +0.42  +0.42     coast straight until it sees again
+```
+
+Scans fade the same way, for the same reason: spinning for a whole cycle
+sweeps the target straight back out of frame. `/status` reports the live value
+as `last_command.turn_authority`.
+
 ### Picking a speed
 
 **Speed has to be chosen against model latency, not by feel.** The car drives
@@ -340,6 +361,7 @@ Debug endpoints return `400` when the providers are not fake.
 | `STALE_AFTER` | `8.0` | Seconds the car may drive on one box before the motors cut; must exceed your measured latency |
 | `BASE_SPEED` | `0.5` | Forward throttle before area scaling — **lower this for a slow first test** |
 | `TURN_GAIN` | `0.8` | Turn aggressiveness; lower it alongside `BASE_SPEED` |
+| `TURN_DECAY` | `1.2` | Seconds over which a decision loses its turn authority; `0` disables the fade |
 | `DEAD_ZONE` | `0.08` | Horizontal offset below which the car drives straight |
 | `ARRIVED_AREA_FRACTION` | `0.5` | Box area fraction that counts as arrived |
 | `ARRIVE_CONFIRM` | `2` | Successive detections that must agree before the run ends |
