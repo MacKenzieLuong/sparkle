@@ -74,13 +74,40 @@ test('lost direct response is reconciled by receipt without resubmitting movemen
   assert.match(connection.getSnapshot().message, /receipt recovered/)
 })
 
-test('stop retains active/pending tasks; reconnect never auto resumes', async t => {
+test('stop cancels the queue and leaves the robot ready for a new target', async t => {
   const { api, connection } = await setup(t)
   await connection.accept(voice('blue flag'))
   await connection.accept(voice('red ball'))
-  await connection.accept(voice('stop', 'stop'))
   assert.equal(connection.getSnapshot().active.target, 'blue flag')
   assert.equal(connection.getSnapshot().queue.length, 1)
+
+  await connection.accept(voice('stop', 'stop'))
+  const stopped = connection.getSnapshot()
+  assert.equal(stopped.active, null, 'the active target is cancelled')
+  assert.equal(stopped.queue.length, 0, 'and the pending ones are dropped')
+  assert.equal(stopped.paused, false, 'not left paused waiting for a resume')
+
+  // The point of clearing the backend's pause: a target sent straight after a
+  // stop has to be accepted, not rejected with resume_required.
+  await connection.accept(voice('green cone'))
+  assert.equal(api.commands.length, 2)
+  assert.equal(api.commands[1].target, 'green cone')
+})
+
+test('a stop whose resume fails leaves the queue cleared and paused, not running', async t => {
+  const { api, connection } = await setup(t)
+  await connection.accept(voice('blue flag'))
+  api.resume = async () => { throw new Error('stale') }
+  await connection.accept(voice('stop', 'stop'))
+  const view = connection.getSnapshot()
+  assert.equal(view.queue.length, 0)
+  assert.equal(view.active, null)
+  assert.equal(view.paused, true, 'falls back to paused so the resume control shows')
+})
+
+test('reconnect never auto resumes', async t => {
+  const { api, connection } = await setup(t)
+  await connection.accept(voice('blue flag'))
   const getStatus = api.status
   api.status = async () => { throw new Error('offline') }
   await connection.refresh()
@@ -155,15 +182,17 @@ test('stopNow reaches the robot even when the view believes it is disconnected',
   api.status = workingStatus
   await connection.stopNow()
   assert.equal(stopped, true, 'the stop was actually attempted')
-  assert.equal(connection.getSnapshot().paused, true, 'and the queue is paused')
+  assert.equal(connection.getSnapshot().queue.length, 0, 'and the queue is cleared')
 })
 
-test('stopNow leaves the queue paused when the robot is unreachable', async t => {
+test('an unreachable stop clears the queue and refuses to dispatch more', async t => {
   const { api, connection } = await setup(t)
   await connection.accept(typedCommand('the red ball'))
   api.stop = async () => { throw new Error('unreachable') }
   await connection.stopNow()
   const view = connection.getSnapshot()
-  assert.equal(view.paused, true, 'a failed stop must not leave the queue running')
+  assert.equal(view.queue.length, 0)
+  assert.equal(view.paused, true,
+    'the car may still be driving, so nothing may be sent on top of it')
   assert.match(view.message, /unknown/i)
 })

@@ -54,14 +54,14 @@ setting TRACK_MAX_AGE 1.5
 # confirmation at proportionally higher spend.
 # Two in flight: the model confirms roughly every 1.7s instead of 3.4s, which
 # halves how long the car can chase something no longer there. Costs 2x.
-setting VISION_CONCURRENCY 2
-setting VISION_STAGGER 1.2
+setting VISION_CONCURRENCY 3
+setting VISION_STAGGER 1.0
 # Minimum gap between successive inference frames, across all the workers, so
 # they sample the whole cycle instead of firing together. The ideal is
 # cycle / VISION_CONCURRENCY (~1.7s at two workers), but it is a floor rather
 # than a target: a worker already running late takes its frame immediately, so
 # setting it too high costs nothing but setting it too low lets frames bunch.
-setting VISION_SPACING 1.5
+setting VISION_SPACING 1.0
 
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
@@ -111,7 +111,7 @@ setting CONTROL_INTERVAL 0      # poll as fast as latency allows
 setting CONTROL_HZ 10
 setting STALE_AFTER 5           # max seconds driving on one decision
 setting MAX_RUN_SECONDS 120     # backstop if /stop is unreachable
-setting MAX_COST_USD 0.25
+setting MAX_COST_USD 0.40
 
 if [ -n "$inherited" ]; then
     echo

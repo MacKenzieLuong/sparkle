@@ -111,15 +111,38 @@ export class RobotConnection {
     this.update({ queue: this.view.queue.slice(1) })
     await this.send(task, resume)
   }
+  // Stop cancels: the queue is dropped and the robot is left ready for the
+  // next target, rather than held paused until something resumes it.
+  //
+  // Clearing the backend's own pause is part of that, not an extra. `/stop`
+  // pauses it server-side and `start()` then rejects a new target with
+  // resume_required, so without the resume below a stop would silently make
+  // the car refuse every command that followed.
   private async runStop() {
     this.generation++
-    this.update({ paused: true, message: 'Pausing navigation…' })
+    this.update({ queue: [], active: null, message: 'Stopping…' })
     try {
-      await this.api.stop(); this.unknown = false
-      this.update({ message: 'Navigation paused. Queue retained.' }); this.log(this.view.message)
+      await this.api.stop()
+      this.unknown = false
     } catch {
-      this.update({ message: 'Stop outcome unknown. Queue stays paused; refreshing status.' }); this.log(this.view.message)
+      // The robot may still be driving. The queue is already cleared, but
+      // pause as well so nothing is dispatched on top of a car that never
+      // received the stop.
+      this.update({ paused: true, message: 'Stop outcome unknown. Queue cleared; not dispatching until the robot answers.' })
+      this.log(this.view.message)
+      await this.refresh()
+      return
     }
+    try {
+      const snapshot = await this.api.status()
+      this.snapshot = snapshot
+      if (snapshot.paused) await this.api.resume(snapshot.revision)
+      this.update({ paused: false })
+    } catch {
+      // Left paused: the poll below reports it, and the resume control shows.
+    }
+    this.update({ message: 'Stopped. Queue cleared; ready for a new target.' })
+    this.log('Stopped · queue cleared')
     await this.refresh()
   }
 
