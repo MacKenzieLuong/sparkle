@@ -200,6 +200,9 @@ class WebcamCamera(CameraProvider):
             )
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        # Shortest queue the backend allows: a queued frame shows the car where
+        # it used to be. Not every backend honours this, hence no check.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     def read(self) -> np.ndarray:
         with self._lock:
