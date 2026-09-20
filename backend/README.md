@@ -503,7 +503,12 @@ side is scaled down rather than the slower one up, since the slower side has no
 headroom left at full throttle.
 
 `MOTOR_LEFT_MIN` / `MOTOR_RIGHT_MIN` lift small commands over the throttle at
-which each wheel starts turning. Below that a loaded motor sits humming while
+which each wheel starts turning. This matters most for **spinning in place**,
+which needs both wheels counter-rotating: if the loaded side never breaks away
+the car swings around a stationary wheel instead, which is an arc, not a
+rotation. So stiction is measured *first* and applied immediately, before
+anything that depends on the car actually pivoting — and the pivot step asks
+you to confirm both wheels turned, discarding the run if they did not. Below that a loaded motor sits humming while
 the other side drives, so the car swings instead of easing forward. A stop is
 never lifted — it reaches the motors as a stop.
 

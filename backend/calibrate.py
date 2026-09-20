@@ -114,6 +114,9 @@ def measure_pivots(driver) -> dict:
     print("  once at the HALF turn     (facing exactly backwards)")
     print("Then once more when it has completely stopped moving.")
     print("Line the car up against a wall or a tile edge to judge the marks.")
+    print("\nWATCH BOTH WHEELS. They must turn in opposite directions. If one")
+    print("sits still the car is swinging around it, not spinning, and the")
+    print("numbers will describe an arc — answer 'n' and raise the minimums.")
     results: dict[str, dict] = {}
 
     for differential in PIVOT_DIFFERENTIALS:
@@ -135,6 +138,15 @@ def measure_pivots(driver) -> dict:
         settled = press("press Enter once it has STOPPED moving... ")
         if settled is None:
             return results
+
+        try:
+            both = input("    did BOTH wheels turn? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return results
+        if both.startswith("n"):
+            print("    -> discarded: that was a swing around one wheel, not a spin")
+            continue
 
         t90, t180 = quarter - started, half - started
         if t180 - t90 < 0.15:
@@ -443,6 +455,24 @@ def main() -> int:
     data = dict(existing)
 
     try:
+        # Stiction first, and applied straight away. A spin in place needs BOTH
+        # wheels counter-rotating; if the loaded side never breaks away the car
+        # swings around a stationary wheel instead, and every angle measured
+        # after that describes an arc rather than a rotation.
+        if not chosen or args.stiction or args.pivots or args.trim:
+            stiction = data.get("stiction") or {}
+            if not chosen or args.stiction or not stiction:
+                measured = measure_stiction(driver)
+                if measured:
+                    stiction = measured
+                    data["stiction"] = measured
+            if stiction:
+                driver.left_min = stiction.get("left", driver.left_min)
+                driver.right_min = stiction.get("right", driver.right_min)
+                print(f"\n  Using minimums left={driver.left_min:.2f} "
+                      f"right={driver.right_min:.2f} for everything below, so both")
+                print("  wheels turn and a pivot is a real pivot.")
+
         if not chosen or args.pivots or args.scale:
             pivots = measure_pivots(driver)
             if pivots:
@@ -464,10 +494,6 @@ def main() -> int:
             trim = measure_trim(driver, data.get("pivots") or {})
             if trim:
                 data["trim"] = trim
-        if not chosen or args.stiction:
-            stiction = measure_stiction(driver)
-            if stiction:
-                data["stiction"] = stiction
         if not chosen or args.forward:
             speeds = measure_forward(driver)
             if speeds:

@@ -72,7 +72,7 @@ def test_pivots_cancel_reaction_time(instant, monkeypatch):
     monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
     #        start, t90,  t180, cut,  settled
     fake_clock(monkeypatch, [0.0, 2.3, 4.3, 4.35, 4.95])
-    scripted(monkeypatch, ["", "", ""])
+    scripted(monkeypatch, ["", "", "", "y"])
     driver = StubDriver()
 
     result = calibrate.measure_pivots(driver)["0.3"]
@@ -88,7 +88,7 @@ def test_pivots_reject_presses_too_close_together(instant, monkeypatch):
     monkeypatch.setattr(calibrate, "PIVOT_DIFFERENTIALS", (0.3,))
     monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
     fake_clock(monkeypatch, [0.0, 2.0, 2.05, 2.1, 2.5])
-    scripted(monkeypatch, ["", "", ""])
+    scripted(monkeypatch, ["", "", "", "y"])
 
     assert calibrate.measure_pivots(StubDriver()) == {}
 
@@ -103,6 +103,16 @@ def test_pivot_stops_the_motors_even_if_aborted(instant, monkeypatch):
     calibrate.measure_pivots(driver)
 
     assert driver.stopped >= 1, "a spinning car must be stopped on abort"
+
+
+def test_pivot_discarded_when_only_one_wheel_turned(instant, monkeypatch):
+    """A swing around a stalled wheel is an arc, not a rotation."""
+    monkeypatch.setattr(calibrate, "PIVOT_DIFFERENTIALS", (0.3,))
+    monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
+    fake_clock(monkeypatch, [0.0, 2.3, 4.3, 4.35, 4.95])
+    scripted(monkeypatch, ["", "", "", "n"])
+
+    assert calibrate.measure_pivots(StubDriver()) == {}
 
 
 class _NullTimer:
