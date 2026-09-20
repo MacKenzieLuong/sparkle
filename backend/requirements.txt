@@ -3,6 +3,7 @@ uvicorn[standard]
 numpy
 opencv-python-headless
 openai
+websockets>=15,<17
 pytest
 picamera2; sys_platform == "linux"
 gpiozero; sys_platform == "linux"
