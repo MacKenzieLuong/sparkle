@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Live demo: real camera, real model, real motors.
 #
 #   export HUAWEI_API_KEY=<key>
@@ -7,7 +7,8 @@
 # Every value below can be overridden from the environment, e.g.
 #   BASE_SPEED=0.3 ./run-demo.sh
 #   DRIVER=fake ./run-demo.sh      # dry run, wheels disconnected
-set -euo pipefail
+# POSIX sh, not bash: on Raspberry Pi OS `sh run-demo.sh` runs under dash.
+set -eu
 cd "$(dirname "$0")"
 
 : "${HUAWEI_API_KEY:?set HUAWEI_API_KEY first (and rotate it if it has ever been pasted anywhere)}"
@@ -16,13 +17,14 @@ cd "$(dirname "$0")"
 # DRIVER=fake ./run-demo.sh. The catch is that an export left over from an
 # earlier step wins in exactly the same silent way — a stale DRIVER=fake once
 # cost a whole demo — so anything inherited gets named before we start.
-inherited=()
+inherited=""
 setting() {
-    local name="$1" default="$2"
-    if [ -n "${!name:-}" ]; then
-        inherited+=("$name=${!name}")
+    eval "current=\${$1:-}"
+    if [ -n "$current" ]; then
+        inherited="$inherited    $1=$current
+"
     else
-        export "$name=$default"
+        export "$1=$2"
     fi
 }
 
@@ -45,12 +47,10 @@ setting STALE_AFTER 8           # max seconds driving on one decision
 setting MAX_RUN_SECONDS 120     # backstop if /stop is unreachable
 setting MAX_COST_USD 0.25
 
-if [ ${#inherited[@]} -gt 0 ]; then
+if [ -n "$inherited" ]; then
     echo
     echo "Using these from your shell instead of the demo defaults:"
-    for pair in "${inherited[@]}"; do
-        echo "    $pair"
-    done
+    printf '%s' "$inherited"
     echo "  (unset them for the standard live configuration)"
 fi
 
