@@ -6,12 +6,16 @@ The steering math currently has no units: `dx` is a fraction of frame width and
 TURN_GAIN converts it to a throttle difference by guesswork, so nothing can
 work out how long to turn for. These experiments supply the missing constants.
 
-Four things get measured:
+What gets measured:
 
   yaw rate    degrees per second at a given throttle difference
   coast       degrees the car keeps rotating after power is cut
   scale       degrees per pixel of horizontal image offset
   speed       metres per second forward at a given throttle
+  stiction    throttle at which each wheel starts, lifted clear of the floor
+  sustain     throttle that keeps the whole car rolling once it already is
+              (--sustain; lower than stiction, and the number MOTOR_*_MIN
+              wants now that MOTOR_KICK handles starting)
 
 No compass or protractor is needed. The car turns while you press Enter at the
 quarter and half turn; pressing at two marks makes your reaction time cancel
@@ -40,6 +44,14 @@ PIVOT_DIFFERENTIALS = (0.25, 0.35, 0.5)
 PIVOT_TIMEOUT = 25.0  # the car is spinning; never wait on a press forever
 FORWARD_THROTTLES = (0.2, 0.35)
 FORWARD_SECONDS = 2.0
+# Ramping down while the car is already rolling. Short dwells and coarse
+# steps on purpose: it is travelling the whole time, and a fine sweep would
+# need a corridor rather than a room.
+SUSTAIN_START = 0.35
+SUSTAIN_STEP = 0.03
+SUSTAIN_FLOOR = 0.05
+SUSTAIN_DWELL = 1.0
+SUSTAIN_TIMEOUT = 40.0  # the car is driving; never wait on a press forever
 
 
 def ask_float(prompt: str) -> Optional[float]:
@@ -415,6 +427,82 @@ def auto_coast(driver, camera, differential: float) -> Optional[dict]:
     }
 
 
+def measure_sustain(driver) -> Optional[dict]:
+    """The lowest throttle that keeps the car rolling once it is already moving.
+
+    This is not stiction, and it is lower. `measure_stiction` lifts a wheel and
+    finds where it starts from rest — static friction, and only the wheel's own.
+    This drives the car along the floor under its own weight and ramps down
+    until it stops, which is kinetic friction for the whole chassis. The gap
+    between the two is most of the usable speed range on this car.
+
+    It is worth a separate experiment because MOTOR_*_MIN is the floor under
+    every command: `condition` adds it before scaling anything else. Sized to
+    start a wheel, the slowest the car can be asked to go is already faster
+    than anyone wants; sized to keep it moving, with MOTOR_KICK doing the
+    starting, the range roughly doubles.
+
+    THE CAR DRIVES FORWARD THROUGHOUT, slowing as it goes. It needs a couple of
+    metres of clear floor, and the same surface it will actually run on —
+    carpet and lino give different answers.
+    """
+    print("\n=== Lowest throttle that keeps it rolling ===")
+    print("The car drives forward and slows in steps. Say at each step whether")
+    print("it is STILL MOVING. Answer 'n' the moment it stops or starts to")
+    print("judder, and that is the answer.")
+    print("\nIt needs a couple of metres ahead of it, on the surface it will")
+    print("really drive on. This measures the whole chassis moving, not one")
+    print("wheel spinning in the air, so it is the number MOTOR_*_MIN wants.")
+
+    if not countdown("drive forward and ramp down", 3):
+        return None
+
+    guard = watchdog(driver, SUSTAIN_TIMEOUT)
+    last_moving: Optional[float] = None
+    steps = []
+    throttle = SUSTAIN_START
+    try:
+        while throttle >= SUSTAIN_FLOOR:
+            # Straight to _drive: the conditioning is exactly what is being
+            # measured, so it must not be applied on the way through.
+            driver._drive(throttle, throttle)
+            time.sleep(SUSTAIN_DWELL)
+            try:
+                answer = input(f"    {throttle:.2f} — still moving? [Y/n/q] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if answer in ("q", "quit", "abort"):
+                return None
+            steps.append({"throttle": round(throttle, 3), "moving": not answer.startswith("n")})
+            if answer.startswith("n"):
+                break
+            last_moving = throttle
+            throttle = round(throttle - SUSTAIN_STEP, 3)
+    finally:
+        driver.stop()
+        guard.cancel()
+
+    if last_moving is None:
+        print(f"\n  It never moved, even at {SUSTAIN_START:.2f}. That is a power or")
+        print("  mechanical problem, not a tuning one: check the battery under load.")
+        return None
+
+    # One step of margin: the operator answers after watching for a moment, so
+    # the true limit sits between this step and the one that failed.
+    recommended = round(last_moving + SUSTAIN_STEP, 3)
+    print(f"\n  -> keeps rolling down to {last_moving:.2f}")
+    print(f"     Use {recommended:.2f} for the minimums, one step of margin above it:")
+    print(f"       export MOTOR_LEFT_MIN={recommended:.2f}")
+    print(f"       export MOTOR_RIGHT_MIN={recommended:.2f}")
+    print("     MOTOR_KICK still has to be set, or the wheels will not start.")
+    return {
+        "sustain_throttle": last_moving,
+        "recommended_min": recommended,
+        "steps": steps,
+    }
+
+
 def measure_stiction(driver) -> dict:
     """The throttle at which each wheel actually starts turning.
 
@@ -602,6 +690,15 @@ def report(data: dict) -> None:
             print(f"    export TURN_LEAD={coast['coast_seconds']:.2f}")
             print("  Halve it if the car starts hunting about the centre.")
 
+    sustain = data.get("sustain") or {}
+    if sustain.get("recommended_min"):
+        print(f"\n  It keeps rolling down to {sustain['sustain_throttle']:.2f}, well under the")
+        print("  throttle needed to start a wheel. The minimums belong at the lower")
+        print("  number, with MOTOR_KICK covering the start:")
+        print(f"    export MOTOR_LEFT_MIN={sustain['recommended_min']:.2f}")
+        print(f"    export MOTOR_RIGHT_MIN={sustain['recommended_min']:.2f}")
+        print("  Set MOTOR_KICK too, or nothing will break away from a floor this low.")
+
     trim = data.get("trim") or {}
     stiction = data.get("stiction") or {}
     if trim or stiction:
@@ -631,11 +728,13 @@ def main() -> int:
     parser.add_argument("--forward", action="store_true", help="forward speed only")
     parser.add_argument("--trim", action="store_true", help="straight-line trim only")
     parser.add_argument("--stiction", action="store_true", help="minimum throttle only")
+    parser.add_argument("--sustain", action="store_true",
+                        help="lowest throttle that keeps the car rolling")
     parser.add_argument("--auto", action="store_true",
                         help="let the camera find the spin throttle and coast")
     args = parser.parse_args()
     chosen = (args.pivots or args.scale or args.forward or args.trim
-              or args.stiction or args.auto)
+              or args.stiction or args.auto or args.sustain)
 
     from drive import make_driver
 
@@ -715,6 +814,10 @@ def main() -> int:
             trim = measure_trim(driver, data.get("pivots") or {})
             if trim:
                 data["trim"] = trim
+        if args.sustain:
+            sustain = measure_sustain(driver)
+            if sustain:
+                data["sustain"] = sustain
         if not chosen or args.forward:
             speeds = measure_forward(driver)
             if speeds:
