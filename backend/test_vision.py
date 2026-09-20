@@ -1,5 +1,3 @@
-import pytest
-
 from vision import _parse_boxes
 
 

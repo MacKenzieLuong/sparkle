@@ -60,6 +60,8 @@ class ControlLoop:
         }
 
     def start(self, target: str) -> None:
+        self._driver.stop()
+        self._vision.start(target)
         with self._lock:
             self.state["target"] = target
             self.state["running"] = True
@@ -82,6 +84,7 @@ class ControlLoop:
             self.state["running"] = False
             self.state["status"] = "stopped"
         self._driver.stop()
+        self._vision.stop()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -125,6 +128,7 @@ class ControlLoop:
                         self.state["status"] = "target_lost"
                 if not self._is_running():
                     self._driver.stop()
+                    self._vision.stop()
                     break
             else:
                 with self._lock:
@@ -147,6 +151,7 @@ class ControlLoop:
                         self.state["running"] = False
                 if cmd.status == "arrived":
                     self._driver.stop()
+                    self._vision.stop()
                     break
 
             time.sleep(self._pause(last_area))
@@ -185,6 +190,13 @@ def _build_app(env: Optional[dict] = None):
         loop.start(req.target.strip())
         return {"started": True, "target": req.target.strip()}
 
+    @app.on_event("shutdown")
+    def shutdown() -> None:
+        loop.stop()
+        release = getattr(camera, "release", None)
+        if release:
+            release()
+
     @app.post("/stop")
     def stop():
         loop.stop()
@@ -199,6 +211,7 @@ def _build_app(env: Optional[dict] = None):
             else None
         )
         snap["mock"] = is_mock()
+        snap["vision_mode"] = "fake" if is_mock() else "http"
         return snap
 
     @app.get("/video")

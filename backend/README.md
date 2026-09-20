@@ -79,12 +79,20 @@ To go live, export the sponsor-key env vars and restart:
 export MOCK=false
 export HUAWEI_API_KEY=<key from yibuapi>
 export HUAWEI_BASE_URL=https://yibuapi.com/v1   # optional, this is the default
-export HUAWEI_MODEL=qwen3.5-omni-flash          # optional, this is the default
+export HUAWEI_MODEL=qwen3.8-omni-flash          # optional, this is the default
 ```
+
+Only one live vision path exists: request/response HTTP calls to
+`OmniVision` on the adaptive cadence described below (`CONTROL_INTERVAL` /
+`SHORT_INTERVAL`). Yibu's documented Realtime WebSocket endpoint does not
+accept image events, so there is no streaming/WebSocket vision mode — an
+earlier experimental adapter for it was removed. To drive the cadence faster
+for a live demo, lower `CONTROL_INTERVAL`/`SHORT_INTERVAL` directly; actual
+cadence is still latency-bound (model round trip + the configured pause).
 
 ## The inference model
 
-One model does object detection: `qwen3.5-omni-flash` (a Qwen3.5-Omni
+One model does object detection: `qwen3.8-omni-flash` (a Qwen Omni
 multimodal model) reached through the sponsor's OpenAI-compatible gateway
 (yibuapi). It is a general multimodal LLM, not a purpose-trained detector like
 YOLO — it is prompted to return bounding-box JSON and boxes are parsed
@@ -154,9 +162,11 @@ Debug endpoints return `400` when the providers are not fake.
 | `MOCK` | `true` | `true` = scripted fake inference; `false` = real API calls |
 | `HUAWEI_API_KEY` | — | Sponsor key; required when `MOCK=false` |
 | `HUAWEI_BASE_URL` | `https://yibuapi.com/v1` | OpenAI-compatible gateway base URL |
-| `HUAWEI_MODEL` | `qwen3.5-omni-flash` | Model used for detection |
-| `CAMERA` | `fake` | `fake` or `picamera2` |
+| `HUAWEI_MODEL` | `qwen3.8-omni-flash` | Model used for detection |
+| `CAMERA` | `fake` | `fake`, `picamera2`, or `rpicam` (one `rpicam-vid` MJPEG process) |
+| `CAMERA_FRAMERATE` | `30` | Capture rate when `CAMERA=rpicam` |
 | `DRIVER` | `fake` | `fake` or `tb6612` (`l298n` accepted as an alias) |
+| `VISION_MAX_TOKENS` | `128` | Small response limit for bounding-box JSON |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | Frame resolution |
 | `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far |
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 
@@ -45,6 +46,54 @@ class PiCamera(CameraProvider):
         with self._lock:
             rgb = self._picam2.capture_array()
         return self._tag_frame(rgb[:, :, ::-1].copy())
+
+
+class RpiCamCamera(CameraProvider):
+    """Read MJPEG frames from one rpicam-vid process shared by all consumers."""
+
+    def __init__(self, width: int = 640, height: int = 480, framerate: int = 30):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._camera = subprocess.Popen(
+            [
+                "rpicam-vid", "-t", "0", "--codec", "mjpeg",
+                "--width", str(width), "--height", str(height),
+                "--framerate", str(framerate), "--nopreview", "-o", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    def read(self) -> np.ndarray:
+        with self._lock:
+            raw = self._read_jpeg()
+        frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError("rpicam-vid produced an invalid JPEG frame")
+        return self._tag_frame(frame)
+
+    def _read_jpeg(self) -> bytes:
+        if self._camera.stdout is None:
+            raise RuntimeError("rpicam-vid stdout is unavailable")
+        stream = self._camera.stdout
+        while True:
+            if stream.read(2) == b"\xff\xd8":
+                break
+            if self._camera.poll() is not None:
+                raise RuntimeError("rpicam-vid exited while waiting for a frame")
+        frame = bytearray(b"\xff\xd8")
+        while True:
+            byte = stream.read(1)
+            if not byte:
+                raise RuntimeError("rpicam-vid ended while reading a frame")
+            frame += byte
+            if frame[-2:] == b"\xff\xd9":
+                return bytes(frame)
+
+    def release(self) -> None:
+        if self._camera.poll() is None:
+            self._camera.terminate()
 
 
 class WebcamCamera(CameraProvider):
@@ -146,6 +195,12 @@ def make_camera(scene: FakeScene) -> CameraProvider:
     height = int(os.environ.get("CAMERA_HEIGHT", "480"))
     if provider == "picamera2":
         return PiCamera(width=width, height=height)
+    if provider in ("rpicam", "rpicam-vid"):
+        return RpiCamCamera(
+            width=width,
+            height=height,
+            framerate=int(os.environ.get("CAMERA_FRAMERATE", "30")),
+        )
     if provider in ("webcam", "usb", "v4l2"):
         index = int(os.environ.get("CAMERA_INDEX", "0"))
         return WebcamCamera(

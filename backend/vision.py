@@ -15,7 +15,7 @@ from scenarios import FakeScene, SCENARIOS
 Box2D = tuple  # (ymin, xmin, ymax, xmax) normalized 0-1000
 
 DEFAULT_BASE_URL = "https://yibuapi.com/v1"
-DEFAULT_MODEL = "qwen3.5-omni-flash"
+DEFAULT_MODEL = "qwen3.8-omni-flash"
 
 
 def is_mock() -> bool:
@@ -29,6 +29,12 @@ class DetectedObject:
 
 
 class VisionProvider:
+    def start(self, target: str) -> None:
+        """Open any per-navigation resources. Stateless providers do nothing."""
+
+    def stop(self) -> None:
+        """Close any per-navigation resources. Stateless providers do nothing."""
+
     def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
         raise NotImplementedError
 
@@ -50,7 +56,8 @@ class OmniVision(VisionProvider):
         api_key: str = "",
         base_url: str = DEFAULT_BASE_URL,
         model: str = DEFAULT_MODEL,
-        jpeg_quality: int = 85,
+        jpeg_quality: int = 70,
+        max_tokens: int = 128,
     ):
         api_key = api_key or os.environ.get("HUAWEI_API_KEY", "")
         if not api_key:
@@ -63,6 +70,7 @@ class OmniVision(VisionProvider):
         self._client = OpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._jpeg_quality = jpeg_quality
+        self._max_tokens = max_tokens
 
     def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
         ok, buf = cv2.imencode(
@@ -93,7 +101,7 @@ class OmniVision(VisionProvider):
                 }
             ],
             temperature=0.2,
-            max_tokens=1024,
+            max_tokens=self._max_tokens,
             stream=True,
         )
 
@@ -133,5 +141,6 @@ def make_vision(scene: Optional[FakeScene] = None) -> VisionProvider:
             api_key=os.environ.get("HUAWEI_API_KEY", ""),
             base_url=os.environ.get("HUAWEI_BASE_URL", DEFAULT_BASE_URL),
             model=os.environ.get("HUAWEI_MODEL", DEFAULT_MODEL),
+            max_tokens=int(os.environ.get("VISION_MAX_TOKENS", "128")),
         )
     return FakeVision(scene=scene or SCENARIOS.get("center", FakeScene()))
