@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 
@@ -21,9 +21,11 @@ from camera import CameraProvider, FakeCamera, make_camera
 from controller import (
     ROTATION_BUDGET,
     ROTATION_BUDGET_DEG,
+    TurnDamper,
     act,
     calibration_deg_per_turn_second,
     command,
+    dx_of,
     enforce_turn_budget,
     enforce_turn_budget_deg,
     turn_authority,
@@ -112,6 +114,11 @@ class ControlLoop:
         # Costs one full call per worker per cycle.
         self._concurrency = max(1, int(os.environ.get("VISION_CONCURRENCY", "1")))
         self._stagger = _env_float("VISION_STAGGER", 1.2)
+        # Minimum gap between successive inference frames, across all workers.
+        # Defaults to the old startup stagger, but is now held for the whole
+        # run rather than decaying after the first few cycles.
+        self._frame_spacing = _env_float("VISION_SPACING", self._stagger)
+        self._slot_at: Optional[float] = None
         # Local tracking bridges the gap between model replies, so the box the
         # car steers on is tens of milliseconds old rather than seconds.
         self._track_hz = _env_float("TRACK_HZ", 20.0)
@@ -157,6 +164,10 @@ class ControlLoop:
         )
         self._rotation_spent = 0.0
         self._budget_seed_at: Optional[float] = None
+        # The lead term's derivative source. Touched only by the control
+        # thread, and fed from whichever box that thread actually steers on.
+        self._damper = TurnDamper()
+        self._damper_stream: Optional[Tuple[bool, Optional[float]]] = None
         self.state = {
             "running": False,
             "target": None,
@@ -215,6 +226,9 @@ class ControlLoop:
             self._tracked_seed = None
             self._rotation_spent = 0.0
             self._budget_seed_at = None
+            self._damper.reset()
+            self._damper_stream = None
+            self._slot_at = None
             self.state.update(
                 running=True,
                 target=target,
@@ -317,6 +331,39 @@ class ControlLoop:
             return self._short_interval
         return self._interval
 
+    def _spacing(self, area_fraction: Optional[float]) -> float:
+        """How far apart successive inference frames should be taken.
+
+        With one worker there is nothing to spread, so this is just its pause
+        and the cadence is unchanged. With several, frames should land evenly
+        across the cycle rather than together, so the floor is VISION_SPACING.
+        """
+        pause = self._pause(area_fraction)
+        if self._concurrency <= 1:
+            return pause
+        return max(pause / self._concurrency, self._frame_spacing)
+
+    def _claim_slot(self, spacing: float) -> float:
+        """The next capture time, from a grid shared by all the workers.
+
+        A one-off stagger at startup decays. Each worker's cycle is its own
+        model latency plus its pause, those differ by up to the second and a
+        half that separates a fast reply from a slow one, so within a few
+        cycles the workers drift into each other and fire together — the
+        frames bunch at one instant and nothing is sampled across the rest of
+        the second. Handing out capture times from one grid keeps successive
+        frames `spacing` apart however the latencies wander, and whichever
+        worker happens to take them.
+
+        A worker that is already late gets `now`, so this never holds back
+        throughput; it only pushes apart workers that have converged.
+        """
+        with self._lock:
+            now = time.monotonic()
+            at = now if self._slot_at is None else max(now, self._slot_at + spacing)
+            self._slot_at = at
+            return at
+
     def _owns(self, epoch: int) -> bool:
         """Whether this worker still drives the car. Caller holds the lock."""
         return self.state["running"] and self._epoch == epoch
@@ -412,12 +459,18 @@ class ControlLoop:
 
     def _perceive(self, epoch: int, index: int = 0) -> None:
         """One request in flight. Several of these run when pipelining."""
-        if index:
-            # Spread the workers out, or they bunch up and the gap between
-            # decisions is no better than with one.
-            time.sleep(self._stagger * index)
         area: Optional[float] = None
         while self._active(epoch):
+            # Wait for this worker's turn on the shared grid. Claiming the slot
+            # before the capture is what spreads the frames: the pause used to
+            # be taken after the reply, so a slow call pushed the next frame
+            # late and the workers converged.
+            at = self._claim_slot(self._spacing(area))
+            delay = at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            if not self._active(epoch):
+                return
             frame_no = None
             error = None
             detection = None
@@ -440,7 +493,8 @@ class ControlLoop:
             if detection is not None:
                 result = act(detection.action, detection.box_2d)
                 area = result.area_fraction
-            time.sleep(self._pause(area))
+            # No pause here: the wait is taken before the next capture, against
+            # the grid, so it cannot accumulate into a drift.
 
     def _track(self, epoch: int) -> None:
         """Follow the model's box locally between replies.
@@ -533,6 +587,14 @@ class ControlLoop:
                     detection, source_at = self._tracked, self._tracked_at
                 else:
                     detection, source_at = self._latest, self._latest_at
+                # The damper differences successive boxes, so it has to know
+                # when the box stops being the same running measurement:
+                # falling back to the model's box, or re-seeding onto a newly
+                # arrived one, is a jump rather than the target moving. Within
+                # a stream the boxes are successive samples of one quantity.
+                damper_stream = (
+                    trackable, self._tracked_seed if trackable else None
+                )
                 age = None if source_at is None else now - source_at
                 model_age = None if self._latest_at is None else now - self._latest_at
                 # Staleness stays measured against the model: a tracker will
@@ -547,9 +609,16 @@ class ControlLoop:
                 self.state["detection_age"] = None if age is None else round(age, 3)
                 self.state["model_age"] = None if model_age is None else round(model_age, 3)
 
+            if damper_stream != self._damper_stream:
+                self._damper.reset()
+                self._damper_stream = damper_stream
+            turn_rate = self._damper.update(
+                dx_of(detection.box_2d) if detection is not None else None, now
+            )
+
             if detection is not None and fresh:
                 authority = turn_authority(age or 0.0)
-                cmd = act(detection.action, detection.box_2d, authority)
+                cmd = act(detection.action, detection.box_2d, authority, turn_rate)
                 with self._lock:
                     if not self._owns(epoch):
                         return
@@ -584,6 +653,7 @@ class ControlLoop:
                         "action": detection.action,
                         "reason": detection.reason,
                         "turn_authority": round(authority, 3),
+                        "turn_rate": round(turn_rate, 3),
                         "turn_budget_used": round(self._rotation_spent, 3),
                         "box_2d": list(detection.box_2d) if detection.box_2d else None,
                         "area_fraction": round(cmd.area_fraction, 3),
@@ -616,6 +686,12 @@ def _banner(camera, vision, driver, loop) -> str:
         + ("   <-- NOTHING WILL MOVE" if fake_driver else "   <-- REAL MOTORS"),
         f"  speed    : BASE_SPEED={controller.BASE_SPEED} TURN_GAIN={controller.TURN_GAIN} "
         f"SEARCH_SPEED={controller.SEARCH_SPEED}",
+        f"  steering : TURN_LEAD={controller.TURN_LEAD:g}s"
+        + (
+            "  -- no lead: a coasting chassis will overshoot"
+            if not controller.TURN_LEAD
+            else ""
+        ),
         loop.budget_banner(),
         f"  limits   : STALE_AFTER={_env_float('STALE_AFTER', 8.0)}s "
         f"MAX_RUN_SECONDS={_env_float('MAX_RUN_SECONDS', 120.0)}s",

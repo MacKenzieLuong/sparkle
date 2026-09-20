@@ -37,6 +37,21 @@ ROTATION_BUDGET = _env_float("ROTATION_BUDGET", 0.5)
 # Only meaningful once `calibration_deg_per_turn_second` has a measurement; the
 # throttle-seconds budget above is the fallback when it has not.
 ROTATION_BUDGET_DEG = _env_float("ROTATION_BUDGET_DEG", 30.0)
+# Seconds of lead in the steering error. A chassis that keeps rotating after
+# the power is cut overshoots under any proportional gain: by the time the
+# error reads zero the car is still turning, and no value of TURN_GAIN closes
+# that gap. Steering on where the error is *heading* cancels it, and the lead
+# that cancels it is the time the car takes to stop — which calibrate.py
+# measures as the coast. 0 disables the term, leaving the plain proportional
+# turn, so it changes nothing until it has a measurement behind it.
+TURN_LEAD = _env_float("TURN_LEAD", 0.0)
+# Time constant of the low-pass on the measured error rate. Differencing a
+# tracked box is noisy enough that the raw rate cannot go on the wheels.
+TURN_RATE_SMOOTHING = _env_float("TURN_RATE_SMOOTHING", 0.15)
+# Beyond these the samples are not describing motion: a gap this long means the
+# loop stalled, and dx (which spans -1 to 1) cannot really slew this fast.
+RATE_MAX_GAP = 0.5
+RATE_MAX = 10.0
 
 CALIBRATION_DEFAULT_FILE = Path(__file__).resolve().parent / "calibration.json"
 
@@ -83,6 +98,61 @@ def turn_authority(age: float) -> float:
     return max(0.0, 1.0 - age / TURN_DECAY)
 
 
+class TurnDamper:
+    """Rate of change of the steering error, smoothed enough to steer on.
+
+    The tracker republishes the box at TRACK_HZ, so the derivative the lead
+    term needs is already being measured — it only has to be differenced and
+    filtered. Owned by the control thread, since it is a running estimate and
+    not a pure function: feeding it from anywhere else corrupts the rate.
+
+    Two things are discontinuities rather than motion, and both report zero
+    instead of an enormous velocity: a long gap between samples, and a jump too
+    large to be real — which is what a re-seed onto a newly arrived model box
+    looks like, the box having moved a second's worth in one tick. A caller
+    that knows the box changed source should `reset()` rather than rely on
+    the jump test catching it.
+    """
+
+    def __init__(self, smoothing: float = TURN_RATE_SMOOTHING) -> None:
+        self._smoothing = max(0.0, smoothing)
+        self.reset()
+
+    def reset(self) -> None:
+        self._dx: Optional[float] = None
+        self._at: Optional[float] = None
+        self._rate = 0.0
+
+    def update(self, dx: Optional[float], now: float) -> float:
+        """Feed the current error; get the filtered rate, in dx per second.
+
+        Safe to call every control tick, including ticks whose box has not
+        changed. Those difference to a rate of zero, but the next tick that
+        does move covers the whole gap in a correspondingly shorter dt, so the
+        estimate stays centred on the true rate rather than being dragged
+        toward zero. Measured at a 5:1 tick-to-box ratio it tracked a known
+        -0.20 dx/s at -0.203, so no separate sample-and-hold is warranted.
+        """
+        if dx is None:
+            self.reset()
+            return 0.0
+        previous, previous_at = self._dx, self._at
+        self._dx, self._at = dx, now
+        if previous is None or previous_at is None:
+            return 0.0
+        dt = now - previous_at
+        if dt <= 0 or dt > RATE_MAX_GAP:
+            self._rate = 0.0
+            return 0.0
+        raw = (dx - previous) / dt
+        if abs(raw) > RATE_MAX:
+            self._rate = 0.0
+            return 0.0
+        alpha = 1.0 if self._smoothing <= 0 else dt / (self._smoothing + dt)
+        self._rate += alpha * (raw - self._rate)
+        return self._rate
+
+
 @dataclass
 class DriveCommand:
     left: float
@@ -94,6 +164,19 @@ class DriveCommand:
 
 def _clamp(value: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
+
+
+def dx_of(box_2d: Optional[Tuple[int, int, int, int]]) -> Optional[float]:
+    """The steering error a box implies: offset from centre, -1 to 1.
+
+    Shared with `command` so the damper differences exactly the quantity the
+    steering acts on, rather than a second copy of the formula that could drift
+    away from it.
+    """
+    if box_2d is None:
+        return None
+    _, xmin, _, xmax = box_2d
+    return ((xmin + xmax) / 2.0 - FRAME_CENTER) / float(FRAME_CENTER)
 
 
 def steer_components(cmd: DriveCommand) -> Tuple[float, float]:
@@ -161,7 +244,9 @@ def enforce_turn_budget_deg(
 
 
 def command(
-    box_2d: Optional[Tuple[int, int, int, int]], turn_scale: float = 1.0
+    box_2d: Optional[Tuple[int, int, int, int]],
+    turn_scale: float = 1.0,
+    turn_rate: float = 0.0,
 ) -> DriveCommand:
     if box_2d is None:
         return DriveCommand(0.0, 0.0, "target_lost", "no detection")
@@ -180,30 +265,39 @@ def command(
     dx = (center_x - FRAME_CENTER) / float(FRAME_CENTER)
     scale = max(MIN_SPEED_SCALE, 1.0 - area_fraction / ARRIVED_AREA_FRACTION)
 
-    turn = TURN_GAIN * dx * scale * turn_scale if abs(dx) > DEAD_ZONE else 0.0
+    # Steer on where the error will be TURN_LEAD seconds from now rather than
+    # where it is, so the turn is already easing off while the car still has
+    # momentum to shed. The dead zone stays on dx itself: inside it the car is
+    # pointed close enough, and letting a noisy rate start a turn there only
+    # makes it twitch about the centre.
+    lead = TURN_LEAD * turn_rate
+    turn = TURN_GAIN * (dx + lead) * scale * turn_scale if abs(dx) > DEAD_ZONE else 0.0
     speed = BASE_SPEED * scale
 
     left = _clamp(speed + turn)
     right = _clamp(speed - turn)
 
-    return DriveCommand(
-        left, right, "moving", f"dx {dx:.2f}, area {area_fraction:.2f}", area_fraction
-    )
+    note = f"dx {dx:.2f}, area {area_fraction:.2f}"
+    if lead:
+        note += f", lead {lead:+.2f}"
+    return DriveCommand(left, right, "moving", note, area_fraction)
 
 
 def act(
     action: str,
     box_2d: Optional[Tuple[int, int, int, int]],
     turn_scale: float = 1.0,
+    turn_rate: float = 0.0,
 ) -> DriveCommand:
     """Turn the model's decision into throttles.
 
     The model chooses *what* to do; the speeds stay here, so no reply can make
     the car move faster than this machine was configured to allow. turn_scale
-    fades rotation out as the decision ages — see turn_authority.
+    fades rotation out as the decision ages — see turn_authority. turn_rate is
+    how fast the error is closing, which damps the turn — see TurnDamper.
     """
     if action == "approach":
-        return command(box_2d, turn_scale)
+        return command(box_2d, turn_scale, turn_rate)
     if action in ("search_left", "search_right"):
         # A scan overshoots for the same reason a turn does: spinning for a
         # whole cycle sweeps the target straight back out of frame.

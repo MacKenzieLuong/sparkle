@@ -56,11 +56,21 @@ setting TRACK_MAX_AGE 1.5
 # halves how long the car can chase something no longer there. Costs 2x.
 setting VISION_CONCURRENCY 2
 setting VISION_STAGGER 1.2
+# Minimum gap between successive inference frames, across all the workers, so
+# they sample the whole cycle instead of firing together. The ideal is
+# cycle / VISION_CONCURRENCY (~1.7s at two workers), but it is a floor rather
+# than a target: a worker already running late takes its frame immediately, so
+# setting it too high costs nothing but setting it too low lets frames bunch.
+setting VISION_SPACING 1.5
 
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
 setting BASE_SPEED 0.2
 setting TURN_GAIN 0.3
+# Seconds of lead in the steering error, cancelling the rotation the car keeps
+# after the power is cut. 0 is the plain proportional turn, which overshoots on
+# a chassis with any momentum; set it from the coast calibrate.py measures.
+setting TURN_LEAD 0
 # A pivoting car keeps rotating after the command stops, so call it centred
 # sooner than a wheeled robot would. Raise further if it still overshoots.
 setting DEAD_ZONE 0.15

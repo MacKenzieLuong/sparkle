@@ -7,9 +7,11 @@ from pathlib import Path
 import pytest
 
 from controller import (
+    TurnDamper,
     act,
     calibration_deg_per_turn_second,
     command,
+    dx_of,
     enforce_turn_budget,
     enforce_turn_budget_deg,
     steer_components,
@@ -303,6 +305,112 @@ def test_unknown_action_halts():
         cmd = act(action, (300, 300, 700, 700))
         assert (cmd.left, cmd.right) == (0.0, 0.0), action
         assert cmd.status == "halted"
+
+
+def _turn_throttle(box, turn_rate: float, **env) -> float:
+    """The turn half of a command, from a fresh interpreter.
+
+    TURN_LEAD is read at import, so the environment only reaches the steering
+    math in a subprocess — same reason as `_throttle_with`.
+    """
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import sys, controller;"
+            "box = tuple(int(v) for v in sys.argv[1].split(','));"
+            "c = controller.command(box, turn_rate=float(sys.argv[2]));"
+            "print(f'{(c.left - c.right) / 2:.6f}')",
+            ",".join(str(v) for v in box), str(turn_rate),
+        ],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return float(result.stdout.strip())
+
+
+HARD_RIGHT = (300, 750, 700, 950)
+CENTRED = (350, 400, 650, 600)
+
+
+def test_dx_of_matches_the_steering_math():
+    assert dx_of(None) is None
+    assert dx_of((300, 400, 700, 600)) == pytest.approx(0.0)
+    assert dx_of((300, 750, 700, 950)) == pytest.approx(0.7)
+
+
+def test_turn_lead_is_off_by_default():
+    import controller
+
+    assert controller.TURN_LEAD == 0.0, "the lead term must be opt-in"
+
+
+def test_turn_rate_does_nothing_without_lead():
+    box = (300, 750, 700, 950)
+    assert command(box, turn_rate=5.0) == command(box, turn_rate=0.0)
+
+
+def test_lead_eases_a_closing_turn_and_hardens_an_opening_one():
+    """The overshoot fix: steer on where the error is heading."""
+    env = {"TURN_LEAD": "0.3"}
+    static = _turn_throttle(HARD_RIGHT, 0.0, **env)
+    closing = _turn_throttle(HARD_RIGHT, -1.0, **env)  # swinging back to centre
+    opening = _turn_throttle(HARD_RIGHT, 1.0, **env)  # still running away
+    assert closing < static < opening
+    assert static > 0
+
+
+def test_lead_does_not_wake_the_dead_zone():
+    """A centred box stays straight however fast the noise says it is moving."""
+    assert _turn_throttle(CENTRED, 5.0, TURN_LEAD="0.3") == pytest.approx(0.0)
+
+
+def test_damper_has_no_rate_from_one_sample():
+    damper = TurnDamper(smoothing=0.0)
+    assert damper.update(0.5, 0.0) == 0.0
+
+
+def test_damper_measures_a_steady_rate():
+    damper = TurnDamper(smoothing=0.0)
+    damper.update(0.0, 0.0)
+    assert damper.update(0.1, 0.1) == pytest.approx(1.0)
+
+
+def test_damper_filters_toward_the_raw_rate():
+    damper = TurnDamper(smoothing=0.1)
+    damper.update(0.0, 0.0)
+    first = damper.update(0.1, 0.1)
+    assert 0 < first < 1.0, "a filtered rate lags the raw one"
+    second = damper.update(0.2, 0.2)
+    assert first < second < 1.0, "and converges toward it"
+
+
+def test_damper_treats_a_jump_as_a_reseed_not_a_velocity():
+    damper = TurnDamper(smoothing=0.0)
+    damper.update(0.0, 0.0)
+    assert damper.update(0.9, 0.001) == 0.0
+
+
+def test_damper_drops_a_long_gap():
+    damper = TurnDamper(smoothing=0.0)
+    damper.update(0.0, 0.0)
+    assert damper.update(0.1, 5.0) == 0.0
+
+
+def test_damper_resets_when_the_box_is_lost():
+    damper = TurnDamper(smoothing=0.0)
+    damper.update(0.0, 0.0)
+    assert damper.update(None, 0.1) == 0.0
+    assert damper.update(0.1, 0.2) == 0.0, "the first sample after a loss has no rate"
+
+
+def test_damper_reports_a_closing_error_as_negative():
+    damper = TurnDamper(smoothing=0.0)
+    damper.update(0.7, 0.0)
+    assert damper.update(0.6, 0.1) < 0, "an error shrinking must damp, not amplify"
 
 
 def test_area_fraction_reported():

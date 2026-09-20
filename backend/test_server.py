@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 
@@ -201,6 +202,115 @@ def test_steering_outpaces_slow_inference():
     assert snap["cycle"] <= 6, "inference ran faster than the mocked model latency"
     assert snap["control_cycle"] > snap["cycle"] * 5
     assert driving != (0.0, 0.0)
+
+
+class RecordingVision(VisionProvider):
+    """Notes when each request's frame was taken, and replies unevenly.
+
+    Uneven on purpose: with equal latencies a startup stagger survives by
+    accident, so the drift only shows when the workers' cycles differ — which
+    live they always do, by the 1.8s between a fast reply and a slow one.
+    """
+
+    def __init__(self, box, delays):
+        self._box = box
+        self._delays = list(delays)
+        self._lock = threading.Lock()
+        self.captured_at = []
+
+    def detect(self, target, frame):
+        with self._lock:
+            index = len(self.captured_at)
+            self.captured_at.append(time.monotonic())
+        time.sleep(self._delays[index % len(self._delays)])
+        return DetectedObject(box_2d=self._box, label=target)
+
+
+def test_inference_frames_stay_spread_out_across_the_cycle():
+    """Frames must sample the whole cycle, not bunch into one instant.
+
+    The workers were staggered once at startup and then paced by a fixed sleep
+    after each reply, so a slow call pushed that worker's next frame late and
+    within a few cycles they converged — two requests firing together and
+    nothing looked at in between.
+    """
+    spacing = 0.3
+    with _env(
+        MOCK="true",
+        CONTROL_INTERVAL="0",
+        SHORT_INTERVAL="0",
+        CONTROL_HZ="50",
+        STALE_AFTER="30",
+        TRACK="false",
+        VISION_CONCURRENCY="2",
+        VISION_SPACING=str(spacing),
+    ):
+        vision = RecordingVision(MOVING_BOX, delays=[0.12, 0.5])
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, FakeDriver())
+        loop.start("ball")
+        time.sleep(3.0)
+        loop.stop()
+        taken = sorted(vision.captured_at)
+
+    gaps = [later - earlier for earlier, later in zip(taken, taken[1:])]
+    assert len(gaps) >= 5, f"too few frames to judge spread: {len(taken)}"
+    assert min(gaps) >= spacing / 2, (
+        f"frames bunched together: {[round(g, 3) for g in gaps]}"
+    )
+
+
+class SceneVision(VisionProvider):
+    """Replies with wherever the scene's box currently is, slowly.
+
+    The camera renders the same box, so image and detection move together and
+    the tracker has something real to follow between replies.
+    """
+
+    def __init__(self, scene, delay=0.0):
+        self._scene = scene
+        self._delay = delay
+
+    def detect(self, target, frame):
+        time.sleep(self._delay)
+        return DetectedObject(box_2d=self._scene.peek(), label=target)
+
+
+def test_closing_error_reads_as_a_negative_turn_rate():
+    """The lead term is silent unless the damper survives between replies.
+
+    Its whole failure mode is quiet: reset the damper too eagerly — on every
+    reply, or every control tick — and the rate reads zero forever, the lead
+    contributes nothing, and the car overshoots exactly as it did before, with
+    nothing in the logs to say so. This asserts the rate really is measured,
+    end to end, with the sign that damps rather than amplifies.
+    """
+    scene = FakeScene(boxes=[(400, 810, 600, 950)])
+    with _env(
+        MOCK="true",
+        CONTROL_INTERVAL="0",
+        SHORT_INTERVAL="0",
+        CONTROL_HZ="50",
+        STALE_AFTER="30",
+        TRACK="true",
+        TRACK_HZ="50",
+        TRACK_MAX_AGE="10",
+    ):
+        loop = ControlLoop(FakeCamera(scene), SceneVision(scene, delay=0.5), FakeDriver())
+        loop.start("ball")
+        time.sleep(0.4)
+        rates = []
+        for centre in range(880, 620, -20):
+            scene.set_override((400, centre - 70, 600, centre + 70))
+            time.sleep(0.05)
+            cmd = loop.snapshot().get("last_command") or {}
+            if cmd.get("turn_rate") is not None:
+                rates.append(cmd["turn_rate"])
+        loop.stop()
+
+    assert rates, "the loop never issued a command to read a rate from"
+    assert any(rate < 0 for rate in rates), (
+        f"a target closing on the centre must read as a negative rate: {rates}"
+    )
 
 
 class JitteryVision(VisionProvider):

@@ -569,6 +569,13 @@ def report(data: dict) -> None:
             print(f"\n  Coast is {worst:.0f} deg at the fastest pivot. Any turn shorter")
             print("  than that overshoots no matter what the gain is — which is the")
             print("  overshoot seen on the floor.")
+            settling = max(
+                (v.get("measured", {}).get("coast_s", 0.0) for v in pivots.values()),
+                default=0.0,
+            )
+            if settling:
+                print("  Give the steering that much lead and it stops instead:")
+                print(f"    export TURN_LEAD={settling:.2f}")
 
     if forward:
         fastest = max(forward.values())
@@ -588,6 +595,12 @@ def report(data: dict) -> None:
         if coast.get("coast_px"):
             print(f"  It coasts ~{coast['coast_px']:.0f} px of image motion after the")
             print("  cut, which is the overshoot to stop short by.")
+        if coast.get("coast_seconds"):
+            print(f"\n  Rotation takes {coast['coast_seconds']:.2f}s to die after the cut.")
+            print("  That is how far ahead the steering has to look to stop")
+            print("  overshooting, which no value of TURN_GAIN can do:")
+            print(f"    export TURN_LEAD={coast['coast_seconds']:.2f}")
+            print("  Halve it if the car starts hunting about the centre.")
 
     trim = data.get("trim") or {}
     stiction = data.get("stiction") or {}
