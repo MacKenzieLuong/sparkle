@@ -1,10 +1,19 @@
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from controller import act, command
+from controller import (
+    act,
+    calibration_deg_per_turn_second,
+    command,
+    enforce_turn_budget,
+    enforce_turn_budget_deg,
+    steer_components,
+)
 
 
 def _throttle_with(**env) -> float:
@@ -137,6 +146,129 @@ def test_stale_decision_stops_turning_but_keeps_driving():
     assert fresh.left != fresh.right, "a fresh decision still turns"
     assert faded.left == pytest.approx(faded.right), "a faded one drives straight"
     assert faded.left > 0, "and keeps moving forward"
+
+
+def _hard_turn_cmd():
+    # dx 0.7, area 0.08 — a strong turn well clear of the arrival threshold.
+    return command((300, 750, 700, 950))
+
+
+def test_turn_budget_exhausted_coasts_straight_at_forward_speed():
+    cmd, spent = enforce_turn_budget(_hard_turn_cmd(), remaining=0.0, dt=0.1)
+    assert spent == 0.0
+    assert cmd.left == pytest.approx(cmd.right)
+    assert cmd.left > 0, "crossing the zero line is a stop, not a straight coast"
+
+
+def test_turn_budget_holds_back_part_of_a_turn():
+    original = _hard_turn_cmd()
+    cmd, spent = enforce_turn_budget(original, remaining=0.02, dt=0.1)
+    _, turn = steer_components(cmd)
+    assert turn == pytest.approx(0.2), "only the remaining 0.2 of turn is allowed"
+    assert spent == pytest.approx(0.2)
+    forward, _ = steer_components(cmd)
+    assert forward == pytest.approx(
+        (original.left + original.right) / 2
+    ), "the budget re-centres the command without slowing it"
+
+
+def test_turn_budget_full_turn_passes_when_roomy():
+    original = _hard_turn_cmd()
+    cmd, spent = enforce_turn_budget(original, remaining=10.0, dt=0.1)
+    assert spent == pytest.approx(abs(original.left - original.right) / 2)
+    assert cmd.left == pytest.approx(original.left)
+    assert cmd.right == pytest.approx(original.right)
+
+
+def test_rotation_budget_is_configurable():
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import controller; print(controller.ROTATION_BUDGET)",
+        ],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, "ROTATION_BUDGET": "0.2"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert float(result.stdout.strip()) == pytest.approx(0.2)
+
+
+def test_rotation_budget_default_is_nonzero():
+    import controller
+
+    assert controller.ROTATION_BUDGET > 0, "a zero budget would never turn"
+
+
+def test_calibration_loader_reads_lowest_usable_pivot(tmp_path):
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({
+        "pivots": {
+            "0.2": {"deg_per_second": 20.0},
+            "0.25": {"deg_per_second": 0.0},  # below stiction — never usable
+            "0.5": {"deg_per_second": 55.0},
+        }
+    }))
+    assert calibration_deg_per_turn_second(str(path)) == pytest.approx(20.0 / 0.2)
+
+
+def test_calibration_loader_none_when_unusable(tmp_path):
+    missing = tmp_path / "nope.json"
+    assert calibration_deg_per_turn_second(str(missing)) is None
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert calibration_deg_per_turn_second(str(bad)) is None
+
+    no_pivots = tmp_path / "empty.json"
+    no_pivots.write_text(json.dumps({"spin": {"minimum_spin": 0.3}}))
+    assert calibration_deg_per_turn_second(str(no_pivots)) is None
+
+
+def test_turn_budget_degrees_spends_degrees():
+    original = _hard_turn_cmd()
+    cmd, spent = enforce_turn_budget_deg(
+        original, remaining_deg=10.0, dt=0.1, deg_per_turn_second=100.0
+    )
+    roomy = abs(original.left - original.right) / 2 * 0.1 * 100.0
+    assert spent == pytest.approx(roomy), "spent is reported in degrees"
+    assert cmd.left == pytest.approx(original.left), "a roomy budget changes nothing"
+
+
+def test_turn_budget_degrees_holds_back_part_of_a_turn():
+    cmd, spent = enforce_turn_budget_deg(
+        _hard_turn_cmd(), remaining_deg=2.0, dt=0.1, deg_per_turn_second=100.0
+    )
+    _, turn = steer_components(cmd)
+    assert turn == pytest.approx(0.2), "only 2 deg / (dt * k) of turn is allowed"
+    assert spent == pytest.approx(2.0)
+
+
+def test_turn_budget_degrees_exhausted_coasts_straight():
+    cmd, spent = enforce_turn_budget_deg(
+        _hard_turn_cmd(), remaining_deg=0.0, dt=0.1, deg_per_turn_second=100.0
+    )
+    assert spent == 0.0
+    assert cmd.left == pytest.approx(cmd.right)
+    assert cmd.left > 0, "exhaustion is a straight coast, not a stop"
+
+
+def test_turn_budget_degrees_uncalibrated_coasts():
+    cmd, spent = enforce_turn_budget_deg(
+        _hard_turn_cmd(), remaining_deg=10.0, dt=0.1, deg_per_turn_second=None
+    )
+    assert spent == 0.0
+    assert cmd.left == pytest.approx(cmd.right), (
+        "no rotation rate -> never invent a degree spend"
+    )
+
+
+def test_degree_budget_default_is_nonzero():
+    import controller
+
+    assert controller.ROTATION_BUDGET_DEG > 0
 
 
 def test_search_scan_also_fades():

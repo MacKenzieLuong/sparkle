@@ -54,6 +54,21 @@ class HangingVision(VisionProvider):
         return DetectedObject(box_2d=self._box, label=target)
 
 
+class OneDecisionVision(VisionProvider):
+    """One decision of the given action, then silence (never goes stale)."""
+
+    def __init__(self, action, box=None):
+        self._action = action
+        self._box = box
+        self.calls = 0
+
+    def detect(self, target, frame):
+        self.calls += 1
+        if self.calls > 1:
+            time.sleep(30)
+        return DetectedObject(box_2d=self._box, label=target, action=self._action)
+
+
 def _wait_until(predicate, message, timeout=2.0):
     deadline = time.time() + timeout
     while not predicate():
@@ -513,6 +528,118 @@ def test_control_falls_back_to_the_model_box_when_tracking_is_off():
 
     assert snap["tracking"] is None, "tracker should not run when TRACK=false"
     assert snap["detection_age"] == snap["model_age"]
+
+
+RIGHT_BOX = (300, 750, 700, 950)  # dx 0.7 — a hard turn the budget must bound
+_DT = 0.01  # CONTROL_HZ=100
+
+
+def test_one_decision_turns_only_inside_its_rotation_budget():
+    """A single reply keeps the box; the car must not keep rotating forever.
+
+    Budget in throttle-seconds; once it is spent the wheels equalise and the
+    car coasts straight at the same forward speed until the next reply.
+    """
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100",
+        STALE_AFTER="30", VISION_CONCURRENCY="1", ROTATION_BUDGET="0.1",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])),
+            OneDecisionVision("approach", RIGHT_BOX), driver,
+        )
+        loop.start("a chair")
+        _wait_until(lambda: driver.last != (0.0, 0.0), "car never started turning")
+        time.sleep(1.0)  # well past the 0.21s it takes to exhaust the budget
+        snap = loop.snapshot()
+        commands = list(driver.commands)
+        loop.stop()
+
+    turned = sum(abs((l - r) / 2) * _DT for l, r in commands)
+    assert 0.08 <= turned <= 0.11, f"turned {turned:.3f} throttle-seconds, budget 0.1"
+    assert snap["rotation_spent"] <= 0.11
+    assert snap["rotation_unit"] == "throttle-seconds", "no calibration -> fallback unit"
+    assert snap["deg_per_turn_second"] is None, "no calibration -> no degree rate"
+    coasts = [c for c in commands if c[0] == c[1] and c[0] > 0]
+    assert coasts, "never coasted straight after the budget ran out"
+    assert coasts[-1] == pytest.approx((0.42, 0.42)), (
+        "coast must keep the forward speed rather than stopping"
+    )
+
+
+def test_new_decision_refills_the_rotation_budget():
+    """A fresh reply re-arms the budget: the car may turn again after a coast."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100",
+        STALE_AFTER="30", VISION_CONCURRENCY="1", ROTATION_BUDGET="0.1",
+    ):
+        driver = FakeDriver()
+        vision = PlanVision(
+            [("search_right", None), ("approach", RIGHT_BOX)], delay=0.9
+        )
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+
+        def has_second_turn():
+            cmds = driver.commands
+            try:
+                first = next(i for i, c in enumerate(cmds) if c[0] != c[1])
+                coast = next(
+                    i for i in range(first, len(cmds)) if cmds[i][0] == cmds[i][1]
+                )
+                next(i for i in range(coast, len(cmds)) if cmds[i][0] != cmds[i][1])
+                return True
+            except StopIteration:
+                return False
+
+        _wait_until(has_second_turn, "second decision never turned again", timeout=6.0)
+        time.sleep(0.5)  # the second turn should also coast once its budget is spent
+        commands = list(driver.commands)
+        loop.stop()
+
+    assert any(
+        c[0] == c[1] and c[0] > 0 for c in commands
+    ), "the second decision over-turned: it never coasted straight again"
+
+
+def test_calibrated_loop_limits_rotation_in_degrees(tmp_path):
+    """With calibration.json the budget is an angle, not throttle-time.
+
+    k = 25 deg/s at differential 0.25 -> 100 deg/s per turn-throttle. A hard
+    turn then spends 6 deg and stops; the same test without calibration would
+    spend throttle-seconds instead and report a different unit.
+    """
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(
+        '{"pivots": {"0.25": {"deg_per_second": 25.0}}}'
+    )
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100",
+        STALE_AFTER="30", VISION_CONCURRENCY="1",
+        CALIBRATION_FILE=str(calibration), ROTATION_BUDGET_DEG="6",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])),
+            OneDecisionVision("approach", RIGHT_BOX), driver,
+        )
+        assert loop._rotation_unit == "deg"
+        assert loop._deg_per_turn_second == pytest.approx(100.0)
+        loop.start("a chair")
+        _wait_until(lambda: driver.last != (0.0, 0.0), "car never started turning")
+        time.sleep(1.0)  # well past the ~0.13s it takes to spend 6 deg
+        snap = loop.snapshot()
+        commands = list(driver.commands)
+        loop.stop()
+
+    turned = sum(abs((l - r) / 2) * _DT * 100.0 for l, r in commands)
+    assert 5.5 <= turned <= 6.5, f"rotated {turned:.2f} deg, budget 6"
+    assert snap["rotation_spent"] <= 6.5
+    assert snap["rotation_unit"] == "deg"
+    assert snap["deg_per_turn_second"] == pytest.approx(100.0)
+    coasts = [c for c in commands if c[0] == c[1] and c[0] > 0]
+    assert coasts, "never coasted straight after the degree budget ran out"
 
 
 def test_run_stops_at_the_time_limit():

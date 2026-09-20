@@ -12,7 +12,16 @@ from pydantic import BaseModel
 
 import controller
 from camera import CameraProvider, FakeCamera, make_camera
-from controller import act, command, turn_authority
+from controller import (
+    ROTATION_BUDGET,
+    ROTATION_BUDGET_DEG,
+    act,
+    calibration_deg_per_turn_second,
+    command,
+    enforce_turn_budget,
+    enforce_turn_budget_deg,
+    turn_authority,
+)
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
 from tracker import BoxTracker
@@ -113,6 +122,19 @@ class ControlLoop:
         self._tracked: Optional[DetectedObject] = None
         self._tracked_at: Optional[float] = None
         self._tracked_seed: Optional[float] = None
+        # One decision may command only so much rotation before the car coasts
+        # straight; re-armed on every accepted reply. With calibration.json the
+        # budget is an angle; without it, throttle-seconds is a best-effort
+        # stand-in that never claims to know degrees.
+        self._deg_per_turn_second = calibration_deg_per_turn_second()
+        self._rotation_unit = "deg" if self._deg_per_turn_second else "throttle-seconds"
+        self._rotation_budget = (
+            _env_float("ROTATION_BUDGET_DEG", ROTATION_BUDGET_DEG)
+            if self._deg_per_turn_second
+            else _env_float("ROTATION_BUDGET", ROTATION_BUDGET)
+        )
+        self._rotation_spent = 0.0
+        self._budget_seed_at: Optional[float] = None
         self.state = {
             "running": False,
             "target": None,
@@ -151,6 +173,8 @@ class ControlLoop:
             self._tracked = None
             self._tracked_at = None
             self._tracked_seed = None
+            self._rotation_spent = 0.0
+            self._budget_seed_at = None
             self.state.update(
                 running=True,
                 target=target,
@@ -190,10 +214,25 @@ class ControlLoop:
         with self._lock:
             snap = dict(self.state)
             snap["stale_after"] = self._stale_after
+            snap["rotation_budget"] = self._rotation_budget
+            snap["rotation_spent"] = round(self._rotation_spent, 3)
+            snap["rotation_unit"] = self._rotation_unit
+            snap["deg_per_turn_second"] = self._deg_per_turn_second
             snap["cycle_time"] = (
                 round(self._cycle_time, 3) if self._cycle_time is not None else None
             )
             return snap
+
+    def budget_banner(self) -> str:
+        if self._deg_per_turn_second:
+            return (
+                f"  rotation : budget {self._rotation_budget:g} deg per decision "
+                f"({self._deg_per_turn_second:.0f} deg/s per turn-throttle)"
+            )
+        return (
+            f"  rotation : budget {self._rotation_budget:g} throttle-seconds per "
+            "decision -- UNcalibrated: run calibrate.py for a degree budget"
+        )
 
     def _pause(self, area_fraction: Optional[float]) -> float:
         if area_fraction is not None and area_fraction >= self._short_interval_area:
@@ -430,10 +469,30 @@ class ControlLoop:
             if detection is not None and fresh:
                 authority = turn_authority(age or 0.0)
                 cmd = act(detection.action, detection.box_2d, authority)
-                self._driver.apply(cmd.left, cmd.right)
                 with self._lock:
                     if not self._owns(epoch):
                         return
+                    # A new reply re-arms the budget: what the car may turn on
+                    # this decision is spent against it, and once gone it
+                    # coasts straight until the model confirms the target again.
+                    if self._latest_at != self._budget_seed_at:
+                        self._rotation_spent = 0.0
+                        self._budget_seed_at = self._latest_at
+                    remaining = self._rotation_budget - self._rotation_spent
+                    if self._deg_per_turn_second:
+                        cmd, spent = enforce_turn_budget_deg(
+                            cmd, remaining, self._control_period,
+                            self._deg_per_turn_second,
+                        )
+                    else:
+                        cmd, spent = enforce_turn_budget(
+                            cmd, remaining, self._control_period
+                        )
+                        # The uncalibrated helper reports turn throttle, not the
+                        # throttle-seconds the budget is measured in.
+                        spent *= self._control_period
+                    self._rotation_spent += spent
+                    self._driver.apply(cmd.left, cmd.right)
                     self.state["status"] = cmd.status
                     self.state["last_command"] = {
                         "left": round(cmd.left, 3),
@@ -444,6 +503,7 @@ class ControlLoop:
                         "action": detection.action,
                         "reason": detection.reason,
                         "turn_authority": round(authority, 3),
+                        "turn_budget_used": round(self._rotation_spent, 3),
                         "box_2d": list(detection.box_2d) if detection.box_2d else None,
                         "area_fraction": round(cmd.area_fraction, 3),
                     }
@@ -458,7 +518,7 @@ class ControlLoop:
             time.sleep(self._control_period)
 
 
-def _banner(camera, vision, driver) -> str:
+def _banner(camera, vision, driver, loop) -> str:
     """Say plainly what is real and what is pretend.
 
     A fake driver looks identical to a working one from the web UI: the car
@@ -475,6 +535,7 @@ def _banner(camera, vision, driver) -> str:
         + ("   <-- NOTHING WILL MOVE" if fake_driver else "   <-- REAL MOTORS"),
         f"  speed    : BASE_SPEED={controller.BASE_SPEED} TURN_GAIN={controller.TURN_GAIN} "
         f"SEARCH_SPEED={controller.SEARCH_SPEED}",
+        loop.budget_banner(),
         f"  limits   : STALE_AFTER={_env_float('STALE_AFTER', 8.0)}s "
         f"MAX_RUN_SECONDS={_env_float('MAX_RUN_SECONDS', 120.0)}s",
     ]
@@ -498,7 +559,7 @@ def _build_app(env: Optional[dict] = None):
     vision = make_vision(scene)
     driver = make_driver()
     loop = ControlLoop(camera, vision, driver)
-    print(_banner(camera, vision, driver), flush=True)
+    print(_banner(camera, vision, driver, loop), flush=True)
 
     app = FastAPI(title="RC Car Pilot")
 
