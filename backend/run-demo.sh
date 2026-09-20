@@ -54,7 +54,9 @@ setting TRACK_MAX_AGE 1.5
 # confirmation at proportionally higher spend.
 # Two in flight: the model confirms roughly every 1.7s instead of 3.4s, which
 # halves how long the car can chase something no longer there. Costs 2x.
-setting VISION_CONCURRENCY 3
+# Pulse mode forces this to 1: overlapping requests all photograph the
+# same uncorrected error and each reply re-commands it.
+setting VISION_CONCURRENCY 1
 setting VISION_STAGGER 1.0
 # Minimum gap between successive inference frames, across all the workers, so
 # they sample the whole cycle instead of firing together. The ideal is
@@ -112,6 +114,10 @@ setting MOTOR_KICK_SECONDS 0.15
 # Much slower overall, and tracking is ignored while it is on.
 setting PULSE_MODE true
 setting PULSE_SECONDS 0.25
+# Settling time after each pulse before the next frame is taken. The
+# chassis coasts, and a frame caught mid-coast shows a correction that has
+# not finished happening, so the next decision commands it again.
+setting PULSE_SETTLE 0.4
 
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows

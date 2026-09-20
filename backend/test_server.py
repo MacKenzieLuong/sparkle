@@ -853,14 +853,18 @@ def test_pulse_mode_moves_once_per_inference_and_stops_between():
     with _env(
         MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
         STALE_AFTER="30", VISION_CONCURRENCY="1", TRACK="true",
-        PULSE_MODE="true", PULSE_SECONDS="0.2",
+        PULSE_MODE="true", PULSE_SECONDS="0.2", PULSE_SETTLE="0.1",
     ):
         driver = FakeDriver()
         loop = ControlLoop(
-            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, delay=0.5), driver
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, delay=0.4), driver
         )
         loop.start("ball")
-        samples, bursts = _duty(driver, 2.2)
+        # Pinned rather than left to the defaults: the cycle here is model
+        # latency plus pulse plus settle, and a later change to any of them
+        # would otherwise quietly outgrow this window and fail the assertion
+        # for a reason that has nothing to do with what it tests.
+        samples, bursts = _duty(driver, 2.4)
         loop.stop()
 
     assert bursts >= 2, f"each inference should start its own burst, saw {bursts}"
@@ -884,3 +888,93 @@ def test_continuous_mode_still_drives_between_inferences():
 
     moving = sum(samples) / len(samples)
     assert moving > 0.8, f"continuous mode drives between replies, moving {moving:.0%}"
+
+
+class ShutterWatchVision(VisionProvider):
+    """Records whether the wheels were turning at the moment of each photo."""
+
+    def __init__(self, box, driver, delay=0.3):
+        self._box = box
+        self._driver = driver
+        self._delay = delay
+        self.moving_at_photo = []
+
+    def detect(self, target, frame):
+        self.moving_at_photo.append(self._driver.last != (0.0, 0.0))
+        time.sleep(self._delay)
+        return DetectedObject(box_2d=self._box, label=target)
+
+
+def test_pulse_mode_never_photographs_while_the_car_is_moving():
+    """Each decision must see what the previous one did.
+
+    A frame taken mid-pulse cannot show the correction that pulse is making,
+    so the next decision commands it again — the car turns twice as far as the
+    error called for, which is how it overshoots and loses the target.
+    """
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="60", TRACK="false", PULSE_MODE="true",
+        PULSE_SECONDS="0.25", PULSE_SETTLE="0.25",
+    ):
+        driver = FakeDriver()
+        vision = ShutterWatchVision(MOVING_BOX, driver, delay=0.3)
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("ball")
+        time.sleep(3.0)
+        loop.stop()
+
+    assert len(vision.moving_at_photo) >= 3, "too few frames to judge"
+    assert not any(vision.moving_at_photo), (
+        f"photographed mid-pulse: {vision.moving_at_photo}"
+    )
+
+
+def test_pulse_mode_refuses_to_overlap_requests():
+    """Overlapping workers each photograph the same uncorrected error."""
+    with _env(MOCK="true", PULSE_MODE="true", VISION_CONCURRENCY="3"):
+        loop = _loop(MOCK="true", PULSE_MODE="true", VISION_CONCURRENCY="3")
+        assert loop._concurrency == 1
+
+    with _env(MOCK="true", PULSE_MODE="false", VISION_CONCURRENCY="3"):
+        loop = _loop(MOCK="true", PULSE_MODE="false", VISION_CONCURRENCY="3")
+        assert loop._concurrency == 3, "continuous mode still pipelines"
+
+
+class LosesTargetVision(VisionProvider):
+    """Finds the target once, then returns nothing at all."""
+
+    def __init__(self, box):
+        self._box = box
+        self.calls = 0
+
+    def detect(self, target, frame):
+        self.calls += 1
+        time.sleep(0.2)
+        if self.calls == 1:
+            return DetectedObject(box_2d=self._box, label=target)
+        return None
+
+
+def test_an_unconfirmed_box_stops_the_car_rather_than_being_driven_at():
+    """A miss means the model just failed to find the target where it was.
+
+    Continuing to steer at that box is how the car carries on into a target it
+    has already lost, with the stale box still drawn over the feed.
+    """
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="60", TRACK="false", PULSE_MODE="false",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), LosesTargetVision(MOVING_BOX), driver
+        )
+        loop.start("ball")
+        _wait_until(lambda: driver.last != (0.0, 0.0), "never started driving")
+        _wait_until(
+            lambda: driver.last == (0.0, 0.0),
+            "kept driving at a box the model could no longer confirm",
+            timeout=3.0,
+        )
+        loop.stop()

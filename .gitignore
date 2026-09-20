@@ -30,3 +30,6 @@ __pycache__/
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# Written by diagnose.py
+backend/diagnose-frame.jpg

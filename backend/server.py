@@ -175,8 +175,22 @@ class ControlLoop:
             "1", "true", "yes",
         )
         self._pulse_seconds = _env_float("PULSE_SECONDS", 0.25)
+        # How long after a pulse to let the car settle before the next frame
+        # is taken. The chassis coasts, and a frame caught mid-coast shows a
+        # correction that has not finished happening.
+        self._pulse_settle = _env_float("PULSE_SETTLE", 0.4)
         self._pulse_until: Optional[float] = None
-        self._pulse_for: Optional[float] = None
+        self._unconfirmed = False
+        # Overlapping requests break this mode outright. Every worker in
+        # flight photographs the same uncorrected error, so each reply
+        # commands the same correction and the car turns N times as far as
+        # it should. One at a time is what makes each decision able to see
+        # what the previous one did.
+        if self._pulse_mode and self._concurrency > 1:
+            print(f"  PULSE_MODE: VISION_CONCURRENCY {self._concurrency} -> 1 "
+                  "(overlapping requests each re-command the same correction)",
+                  flush=True)
+            self._concurrency = 1
         self.state = {
             "running": False,
             "target": None,
@@ -239,7 +253,7 @@ class ControlLoop:
             self._damper_stream = None
             self._slot_at = None
             self._pulse_until = None
-            self._pulse_for = None
+            self._unconfirmed = False
             self.state.update(
                 running=True,
                 target=target,
@@ -362,6 +376,25 @@ class ControlLoop:
             return pause
         return max(pause / self._concurrency, self._frame_spacing)
 
+    def _await_settled(self, epoch: int) -> None:
+        """Hold the next frame until the car has finished moving and settled.
+
+        Photographing during a pulse gives the model a blurred frame taken
+        halfway through a correction, and — worse — one that does not yet show
+        what the correction did, so the next decision commands it again. The
+        whole point of pulsing is that each decision sees the result of the
+        last, and that only holds if the shutter waits for the wheels.
+        """
+        while self._active(epoch):
+            with self._lock:
+                until = self._pulse_until
+            if until is None:
+                return
+            remaining = until + self._pulse_settle - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.05))
+
     def _claim_slot(self, spacing: float) -> float:
         """The next capture time, from a grid shared by all the workers.
 
@@ -442,14 +475,29 @@ class ControlLoop:
             infer["reason"] = detection.reason if detection else None
 
             if detection is None:
+                # The last box is no longer confirmed. Keep it -- a single
+                # parse blip should not end the run -- but stop driving on it:
+                # continuing to steer toward where the target was, after the
+                # model has just failed to find it there, is how the car
+                # carries on into a target it has already lost.
+                self._unconfirmed = True
                 self.state["missed"] += 1
                 if self.state["missed"] >= self._miss_limit:
                     return "target_lost"
                 return None
 
+            self._unconfirmed = False
             self.state["missed"] = 0
             self._latest = detection
             self._latest_at = time.monotonic()
+            if self._pulse_mode:
+                # Armed here rather than when the control thread next looks,
+                # because this worker is about to go straight round and ask for
+                # the next frame. Arming a tick later leaves a window in which
+                # it photographs before its own pulse has begun, and that frame
+                # then cannot show what the pulse did -- the exact double
+                # correction the mode exists to prevent.
+                self._pulse_until = self._latest_at + self._pulse_seconds
             self.state["action"] = detection.action
 
             searching = detection.action in ("search_left", "search_right")
@@ -490,6 +538,10 @@ class ControlLoop:
                 time.sleep(delay)
             if not self._active(epoch):
                 return
+            if self._pulse_mode:
+                self._await_settled(epoch)
+                if not self._active(epoch):
+                    return
             frame_no = None
             error = None
             detection = None
@@ -614,9 +666,6 @@ class ControlLoop:
                 # while looking at a frame. Slower by construction, and the
                 # overshoot that the lead term and the rotation budget exist to
                 # correct simply cannot accumulate.
-                if self._pulse_mode and source_at is not None and source_at != self._pulse_for:
-                    self._pulse_for = source_at
-                    self._pulse_until = now + self._pulse_seconds
                 pulsing = (
                     not self._pulse_mode
                     or (self._pulse_until is not None and now < self._pulse_until)
@@ -638,6 +687,7 @@ class ControlLoop:
                     age is not None
                     and model_age is not None
                     and model_age <= self._stale_after
+                    and not self._unconfirmed
                 )
                 self.state["control_cycle"] += 1
                 self.state["detection_age"] = None if age is None else round(age, 3)
