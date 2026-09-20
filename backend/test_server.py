@@ -4,6 +4,8 @@ import sys
 import time
 from contextlib import contextmanager
 
+import cv2
+import numpy as np
 import pytest
 
 from camera import FakeCamera
@@ -422,6 +424,65 @@ def test_out_of_order_replies_never_overwrite_a_newer_one():
     assert snap["infer"]["label"] == "newer", "a stale reply replaced a fresher one"
     assert snap["out_of_order"] == 1
     assert snap["cycle"] == 1, "the dropped reply should not count as a cycle"
+
+
+class TrackableCamera(FakeCamera):
+    """A textured scene whose target slides right, so flow has work to do."""
+
+    def __init__(self, scene):
+        super().__init__(scene)
+        self.shift = 0
+
+    def read(self):
+        rng = np.random.default_rng(5)
+        frame = rng.integers(60, 190, (240, 320, 3), dtype=np.uint8)
+        centre = (110 + self.shift, 120)
+        cv2.circle(frame, centre, 40, (30, 30, 30), -1)
+        for offset in range(-34, 34, 7):
+            cv2.line(frame, (centre[0] + offset, 86), (centre[0] + offset, 154),
+                     (220, 220, 220), 2)
+        self.shift = min(self.shift + 2, 120)
+        return self._tag_frame(frame)
+
+
+def test_tracking_keeps_the_steering_box_current():
+    """Between model replies the box should age in ms, not seconds."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="30", TRACK="true", TRACK_HZ="30",
+    ):
+        camera = TrackableCamera(FakeScene(boxes=[]))
+        loop = ControlLoop(camera, SlowVision((330, 220, 670, 470), 1.0), FakeDriver())
+        loop.start("a chair")
+        _wait_until(
+            lambda: loop.snapshot()["detection_age"] is not None, "never steered"
+        )
+        time.sleep(0.8)  # well inside one 1.0s model call
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["tracking"] not in (None, "lost"), f"tracker never held: {snap['tracking']}"
+    assert snap["detection_age"] < 0.3, (
+        f"steering on a {snap['detection_age']}s-old box; tracking is not being used"
+    )
+    assert snap["model_age"] > snap["detection_age"], "model box should be the older one"
+
+
+def test_control_falls_back_to_the_model_box_when_tracking_is_off():
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="30", TRACK="false",
+    ):
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, 0.5), FakeDriver()
+        )
+        loop.start("a chair")
+        _wait_until(lambda: loop.snapshot()["detection_age"] is not None, "never steered")
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["tracking"] is None, "tracker should not run when TRACK=false"
+    assert snap["detection_age"] == snap["model_age"]
 
 
 def test_run_stops_at_the_time_limit():

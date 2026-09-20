@@ -41,10 +41,15 @@ setting DRIVER tb6612
 setting VISION_WIDTH 320
 setting VISION_HEIGHT 240
 setting VISION_EXPLAIN false
-# Requests in flight at once. Qwen Realtime cannot take local frames, so the
-# only way to hear from the model more often over HTTP is to overlap calls.
-# Costs one full call per worker: 3 here means 3x the spend for 3x the rate.
-setting VISION_CONCURRENCY 3
+# Local tracking carries the box between replies, so the car steers on a box
+# tens of milliseconds old instead of seconds. That is what makes it react,
+# and it costs ~2% of one core rather than a multiple of the API bill.
+setting TRACK true
+setting TRACK_HZ 20
+# With tracking doing the reacting, one request in flight is enough: the model
+# only has to confirm the target and correct drift. Raise for faster
+# confirmation at proportionally higher spend.
+setting VISION_CONCURRENCY 1
 setting VISION_STAGGER 1.2
 
 # --- how fast ---------------------------------------------------------------

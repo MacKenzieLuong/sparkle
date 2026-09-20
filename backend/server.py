@@ -15,6 +15,7 @@ from camera import CameraProvider, FakeCamera, make_camera
 from controller import act, command, turn_authority
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
+from tracker import BoxTracker
 from vision import (
     DetectedObject,
     FakeVision,
@@ -83,6 +84,13 @@ class ControlLoop:
         # Costs one full call per worker per cycle.
         self._concurrency = max(1, int(os.environ.get("VISION_CONCURRENCY", "1")))
         self._stagger = _env_float("VISION_STAGGER", 1.2)
+        # Local tracking bridges the gap between model replies, so the box the
+        # car steers on is tens of milliseconds old rather than seconds.
+        self._track_hz = _env_float("TRACK_HZ", 20.0)
+        self._track_enabled = os.environ.get("TRACK", "true").lower() in (
+            "1", "true", "yes",
+        )
+        self._track_min_confidence = _env_float("TRACK_MIN_CONFIDENCE", 0.4)
         # Last resort: if the network drops, /stop is unreachable and nothing
         # else bounds a drive that never arrives.
         self._max_run_seconds = _env_float("MAX_RUN_SECONDS", 120.0)
@@ -97,6 +105,10 @@ class ControlLoop:
         self._arrived_streak = 0
         self._search_streak = 0
         self._last_terminal: Optional[str] = None
+        self._tracker = BoxTracker()
+        self._tracked: Optional[DetectedObject] = None
+        self._tracked_at: Optional[float] = None
+        self._tracked_seed: Optional[float] = None
         self.state = {
             "running": False,
             "target": None,
@@ -108,8 +120,10 @@ class ControlLoop:
             "search_streak": 0,
             "out_of_order": 0,
             "action": None,
+            "tracking": None,
             "error": None,
             "detection_age": None,
+            "model_age": None,
             "last_command": None,
             "infer": _blank_infer(),
         }
@@ -129,6 +143,10 @@ class ControlLoop:
             self._arrived_streak = 0
             self._search_streak = 0
             self._last_terminal = None
+            self._tracker.reset()
+            self._tracked = None
+            self._tracked_at = None
+            self._tracked_seed = None
             self.state.update(
                 running=True,
                 target=target,
@@ -140,8 +158,10 @@ class ControlLoop:
                 search_streak=0,
                 out_of_order=0,
                 action=None,
+                tracking=None,
                 error=None,
                 detection_age=None,
+                model_age=None,
                 last_command=None,
                 infer=_blank_infer(),
             )
@@ -150,6 +170,8 @@ class ControlLoop:
                 target=self._perceive, args=(epoch, index), daemon=True
             ).start()
         threading.Thread(target=self._control, args=(epoch,), daemon=True).start()
+        if self._track_enabled:
+            threading.Thread(target=self._track, args=(epoch,), daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
@@ -296,6 +318,66 @@ class ControlLoop:
                 area = result.area_fraction
             time.sleep(self._pause(area))
 
+    def _track(self, epoch: int) -> None:
+        """Follow the model's box locally between replies.
+
+        Only ever a bridge: it re-seeds on every new detection and reports its
+        own failure, so the control thread can go back to the model's box
+        rather than steer on a tracker that has lost the target.
+        """
+        period = 1.0 / max(self._track_hz, 0.1)
+        while self._active(epoch):
+            started = time.monotonic()
+            with self._lock:
+                detection = self._latest
+                seeded_from = self._latest_at
+                already = self._tracked_seed
+            if detection is None or detection.box_2d is None:
+                time.sleep(period)
+                continue
+
+            try:
+                grey = cv2.cvtColor(self._camera.read(), cv2.COLOR_BGR2GRAY)
+            except Exception:
+                # The perception workers report camera failures; tracking just
+                # stops contributing rather than ending the run twice over.
+                time.sleep(period)
+                continue
+
+            if seeded_from != already:
+                ok = self._tracker.seed(grey, tuple(detection.box_2d))
+                with self._lock:
+                    self._tracked_seed = seeded_from
+                    self._tracked = detection if ok else None
+                    self._tracked_at = time.monotonic() if ok else None
+                    self.state["tracking"] = "seeded" if ok else "no features"
+            else:
+                result = self._tracker.update(grey)
+                with self._lock:
+                    if not self._owns(epoch):
+                        return
+                    if result is None:
+                        self._tracked = None
+                        self._tracked_at = None
+                        self.state["tracking"] = "lost"
+                    else:
+                        box, confidence = result
+                        if confidence >= self._track_min_confidence:
+                            self._tracked = DetectedObject(
+                                box_2d=box,
+                                label=detection.label,
+                                action=detection.action,
+                                reason=detection.reason,
+                            )
+                            self._tracked_at = time.monotonic()
+                            self.state["tracking"] = f"{confidence:.2f}"
+                        else:
+                            self._tracked = None
+                            self._tracked_at = None
+                            self.state["tracking"] = f"weak {confidence:.2f}"
+
+            time.sleep(max(0.0, period - (time.monotonic() - started)))
+
     def _control(self, epoch: int) -> None:
         while self._active(epoch):
             now = time.monotonic()
@@ -312,11 +394,25 @@ class ControlLoop:
             with self._lock:
                 if not self._owns(epoch):
                     return
-                detection = self._latest
-                age = None if self._latest_at is None else now - self._latest_at
-                fresh = age is not None and age <= self._stale_after
+                # Prefer the tracked box: same decision, but current rather
+                # than seconds old, so the turn is still the right turn.
+                if self._tracked is not None and self._tracked_at is not None:
+                    detection, source_at = self._tracked, self._tracked_at
+                else:
+                    detection, source_at = self._latest, self._latest_at
+                age = None if source_at is None else now - source_at
+                model_age = None if self._latest_at is None else now - self._latest_at
+                # Staleness stays measured against the model: a tracker will
+                # happily follow a box long after the model stopped confirming
+                # that the target is really there.
+                fresh = (
+                    age is not None
+                    and model_age is not None
+                    and model_age <= self._stale_after
+                )
                 self.state["control_cycle"] += 1
                 self.state["detection_age"] = None if age is None else round(age, 3)
+                self.state["model_age"] = None if model_age is None else round(model_age, 3)
 
             if detection is not None and fresh:
                 authority = turn_authority(age or 0.0)

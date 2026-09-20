@@ -53,6 +53,7 @@ request to time out.
 | `run-demo.sh` | The full live configuration in one command |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (asks the model what to do) |
 | `controller.py` | Executes the model's action under local speed limits; `command()` is the pure steering math |
+| `tracker.py` | Optical-flow box tracking that bridges the gap between model replies |
 | `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
 | `drive.py` | `TB6612Driver` (dual TB6612FNG, gpiozero), `FakeDriver` (logs) |
 | `scenarios.py` | Scripted bounding-box scenarios shared by `FakeVision` and `FakeCamera` |
@@ -124,7 +125,35 @@ Requests use a `VISION_TIMEOUT` (default 10s) with **retries disabled**: a
 retry would re-send a frame describing where the car used to be, so failing
 fast and sending a fresh frame next cycle is both cheaper and more correct.
 
-## Why calls overlap
+## Tracking between model calls
+
+The model answers every few seconds. Steering on a box that old is the real
+cause of weaving and overshoot, so the box it returns seeds feature points that
+are followed locally frame to frame with optical flow. Measured on a Pi 5, with
+a mocked 3s model:
+
+| | box the car steers on |
+| --- | --- |
+| `TRACK=false` | 1.95 s old on average, 2.50 s at worst |
+| `TRACK=true` | **0.04 s old** |
+
+That costs 0.83 ms per frame — under 2% of one core at 20 Hz — against a
+640x480 JPEG decode at 2.75 ms which the camera read already pays.
+
+Tracking is only ever a bridge, and it is treated as one:
+
+- every new detection re-seeds it, so drift never accumulates across replies
+- each update reports confidence from surviving points and a forward-backward
+  error check; below `TRACK_MIN_CONFIDENCE` it reports failure instead of a
+  plausible-looking box, and the control thread falls back to the model's
+- staleness is still measured against the **model**, never the tracker: flow
+  will happily follow a box long after the model stopped confirming that the
+  target is there at all
+
+`/status` shows `tracking` (confidence, `lost`, or `seeded`), `detection_age`
+for the box being steered on, and `model_age` for the last real reply.
+
+## Why calls can overlap
 
 One model call takes 2.5-4.3s and that cannot be reduced: Qwen's Realtime
 WebSocket was probed against yibuapi's own documented protocol and will not
@@ -142,6 +171,9 @@ in flight. `VISION_CONCURRENCY` workers each hold one, staggered by
 | 1 | ~3.4 s | 1x |
 | 2 | ~1.7 s | 2x |
 | 3 | ~1.1 s | 3x |
+
+With tracking on, this is rarely worth paying for: the model only has to
+confirm the target and correct drift, which one request in flight does fine.
 
 Replies then finish out of order. Every result is keyed on when its frame was
 *captured*, and one describing an older frame is dropped rather than allowed to
@@ -374,6 +406,11 @@ Debug endpoints return `400` when the providers are not fake.
 | `VISION_EXPLAIN` | `false` | Ask the model to justify its action. Readable while tuning, but output tokens are generated serially and cost latency on every call |
 | `VISION_CONCURRENCY` | `1` | Requests in flight at once. `3` gives a decision ~3x as often, and costs 3x |
 | `VISION_STAGGER` | `1.2` | Seconds between worker starts, so overlapping requests spread out instead of bunching |
+| `TRACK` | `true` | Follow the box locally between model replies |
+| `TRACK_HZ` | `20` | Tracker update rate |
+| `TRACK_MIN_CONFIDENCE` | `0.4` | Surviving-point fraction below which tracking reports failure |
+| `TRACK_POINTS` | `80` | Features seeded inside each new box |
+| `TRACK_FB_TOLERANCE` | `2.0` | Pixels of forward-backward error a point may have and still count |
 | `MAX_COST_USD` | `1.00` | Estimated spend cap for the process; `0` disables it |
 | `VISION_INPUT_USD_PER_MILLION` | `0.55` | Image-token input rate used by the estimate |
 | `VISION_OUTPUT_USD_PER_MILLION` | `2.20` | Output-token rate used by the estimate |
