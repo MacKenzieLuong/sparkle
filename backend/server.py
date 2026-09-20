@@ -69,6 +69,7 @@ class ControlLoop:
         self._stale_factor = _env_float("STALE_FACTOR", 1.5)
         self._stale_min = _env_float("STALE_MIN", 1.0)
         self._miss_limit = 3
+        self._arrive_confirm = int(os.environ.get("ARRIVE_CONFIRM", "2"))
         self._lock = threading.Lock()
         self._epoch = 0
         self._latest: Optional[DetectedObject] = None
@@ -81,6 +82,7 @@ class ControlLoop:
             "cycle": 0,
             "control_cycle": 0,
             "missed": 0,
+            "arrived_streak": 0,
             "error": None,
             "detection_age": None,
             "last_command": None,
@@ -103,6 +105,7 @@ class ControlLoop:
                 cycle=0,
                 control_cycle=0,
                 missed=0,
+                arrived_streak=0,
                 error=None,
                 detection_age=None,
                 last_command=None,
@@ -160,6 +163,7 @@ class ControlLoop:
     def _perceive(self, epoch: int) -> None:
         area: Optional[float] = None
         previous_finish: Optional[float] = None
+        arrived_streak = 0
         while self._active(epoch):
             frame_no = None
             error = None
@@ -198,8 +202,19 @@ class ControlLoop:
             if lost:
                 self._finish("target_lost", epoch)
                 return
+
             if detection is not None:
-                area = command(detection.box_2d).area_fraction
+                result = command(detection.box_2d)
+                area = result.area_fraction
+                # One hallucinated full-frame box reads as arrival. The control
+                # thread already halts on it; only end the run once successive
+                # detections agree, so a bad frame costs a pause, not the drive.
+                arrived_streak = arrived_streak + 1 if result.status == "arrived" else 0
+                with self._lock:
+                    self.state["arrived_streak"] = arrived_streak
+                if arrived_streak >= self._arrive_confirm:
+                    self._finish("arrived", epoch)
+                    return
             time.sleep(self._pause(area))
 
     def _control(self, epoch: int) -> None:
@@ -230,9 +245,6 @@ class ControlLoop:
                         "box_2d": list(detection.box_2d),
                         "area_fraction": round(cmd.area_fraction, 3),
                     }
-                if cmd.status == "arrived":
-                    self._finish("arrived", epoch)
-                    return
             else:
                 self._driver.stop()
                 with self._lock:

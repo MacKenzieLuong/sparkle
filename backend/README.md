@@ -200,9 +200,15 @@ On `POST /direct`:
    *measured* cycle so a deliberately slow cadence never trips it, while a hung
    request trips it within a couple of cycles. `/status` reports the live value
    as `stale_after`.
-5. Exit conditions:
-   - **arrived** — bounding box covers ≥ 50% of the frame → stop.
-   - **target_lost** — no detection for 3 consecutive perception cycles → stop.
+5. Exit conditions, both owned by the perception thread so one bad frame
+   cannot end a drive:
+   - **arrived** — the box covers ≥ `ARRIVED_AREA_FRACTION` of the frame on
+     `ARRIVE_CONFIRM` (default 2) successive detections. The car halts on the
+     *first* one, because the steering math returns zero throttle for it, but
+     the run only ends once another detection agrees. Live testing produced a
+     hallucinated full-frame box between two good ones — under a single-frame
+     rule that stops the car for good, mid-drive.
+   - **target_lost** — no detection for 3 consecutive perception cycles.
      Camera and API errors count as misses, so a persistent failure ends the
      run rather than looping forever; the message lands in `status.error`.
    - **manual stop** — `POST /stop`.
@@ -290,6 +296,7 @@ Debug endpoints return `400` when the providers are not fake.
 | `TURN_GAIN` | `0.8` | Turn aggressiveness; lower it alongside `BASE_SPEED` |
 | `DEAD_ZONE` | `0.08` | Horizontal offset below which the car drives straight |
 | `ARRIVED_AREA_FRACTION` | `0.5` | Box area fraction that counts as arrived |
+| `ARRIVE_CONFIRM` | `2` | Successive detections that must agree before the run ends |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
 | `TB6612_AIN1`…`TB6612_STBY` | see `.env.example` | GPIO pins for the dual TB6612FNG (SparkFun) |
 | `TB6612_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |

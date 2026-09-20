@@ -171,6 +171,56 @@ def test_motors_cut_when_detection_goes_stale():
     assert snap["running"] is True, "a stale box stops the motors, not the navigation"
 
 
+class ScriptedVision(VisionProvider):
+    """Replays fixed boxes, then repeats the last one."""
+
+    def __init__(self, boxes):
+        self._boxes = list(boxes)
+        self.calls = 0
+
+    def detect(self, target, frame):
+        box = self._boxes[min(self.calls, len(self._boxes) - 1)]
+        self.calls += 1
+        return None if box is None else DetectedObject(box_2d=box, label=target)
+
+
+def test_one_spurious_arrival_does_not_end_the_drive():
+    """The sequence a live camera produced: a full-frame box between good ones."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_MIN="5", ARRIVE_CONFIRM="2",
+    ):
+        driver = FakeDriver()
+        vision = ScriptedVision([MOVING_BOX, ARRIVED_BOX, MOVING_BOX, MOVING_BOX])
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(lambda: vision.calls >= 4, "loop stalled")
+        time.sleep(0.1)
+        snap = loop.snapshot()
+        driving = driver.last
+        loop.stop()
+
+    assert snap["running"] is True, "a single bad frame ended the run"
+    assert snap["status"] == "moving"
+    assert driving != (0.0, 0.0), "car should have resumed after the bad frame"
+
+
+def test_repeated_arrival_still_ends_the_drive():
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_MIN="5", ARRIVE_CONFIRM="2",
+    ):
+        driver = FakeDriver()
+        vision = ScriptedVision([MOVING_BOX, ARRIVED_BOX, ARRIVED_BOX])
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(lambda: not loop.snapshot()["running"], "never confirmed arrival")
+        snap = loop.snapshot()
+
+    assert snap["status"] == "arrived"
+    assert driver.last == (0.0, 0.0)
+
+
 def test_arrival_stops_navigation():
     with _env(MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100"):
         driver = FakeDriver()
