@@ -20,9 +20,12 @@ class FakeDriver(Driver):
 
     def apply(self, left: float, right: float) -> None:
         with self._lock:
+            # The control thread re-applies at a fixed rate; only log changes.
+            changed = (left, right) != self.last
             self.last = (left, right)
             self.commands.append((left, right))
-        print(f"[FakeDriver] left={left:+.2f} right={right:+.2f}")
+        if changed:
+            print(f"[FakeDriver] left={left:+.2f} right={right:+.2f}")
 
 
 class TB6612Driver(Driver):

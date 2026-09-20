@@ -7,31 +7,47 @@ right motor throttles, and the car drives until it arrives or loses the target.
 
 ## Architecture
 
+A model call takes seconds; steering must not. So `POST /direct` starts two
+threads that share one "freshest box" record:
+
 ```
 User types "go to the red ball" on web page
         │  POST /direct {"target": "..."}
         ▼
    FastAPI server (on the Pi)
-        │  starts ControlLoop (background thread)
-        │  every CONTROL_INTERVAL (default 5s), immediately on Go:
-        │    grab frame from camera ───────────► Pi Camera (picamera2) or fake
-        │    vision.detect(target, frame) ─────► OmniVision (yibuapi/OMNI) or fake
-        │    JSON: [{"box_2d":[ymin,xmin,ymax,xmax],"label":...}] or not found
-        ▼
-   Steering math (controller.command)
-        │  box center vs frame center → turn left/right
-        │  box size → approach speed; box ~50%+ of frame → arrived
-        ▼
-   Motor driver ──► left/right throttle in [-1, 1]
-        │  H-bridge (dual TB6612FNG) on GPIO or fake (logs)
-        └─ holds last command during the pause between inference calls
+        │
+        ├── perception thread ── every CONTROL_INTERVAL, immediately on Go:
+        │     grab frame from camera ──────────► Pi Camera / rpicam-vid / fake
+        │     vision.detect(target, frame) ────► OmniVision (yibuapi) or fake
+        │     JSON: [{"box_2d":[ymin,xmin,ymax,xmax],"label":...}] or not found
+        │            │
+        │            ▼
+        │     ┌──────────────────────┐
+        │     │ latest box + arrival │  ◄── shared, lock-guarded
+        │     │ timestamp            │
+        │     └──────────────────────┘
+        │            │
+        └── control thread ── every 1/CONTROL_HZ (default 10 Hz):
+              read freshest box; if older than the deadman window → motors off
+              else controller.command(box) ────► left/right throttle in [-1, 1]
+                     box center vs frame center → turn
+                     box size → approach speed; ≥50% of frame → arrived
+                     │
+                     ▼
+              Motor driver: H-bridge (dual TB6612FNG) on GPIO or fake (logs)
 ```
+
+The car therefore keeps steering at a steady 10 Hz off the last box it saw,
+instead of freezing for the whole duration of each model round trip. If
+perception stalls — hung request, dead camera, dropped network — the box goes
+stale and the control thread cuts the motors without waiting for the request
+to time out.
 
 ## Layout
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | FastAPI app, MJPEG stream, `ControlLoop` background thread, debug endpoints |
+| `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (real inference via yibuapi) |
 | `controller.py` | Pure steering math: bounding box → `DriveCommand(left, right, status)` |
 | `camera.py` | `PiCamera` (picamera2 CSI), `FakeCamera` (synthetic frames) |
@@ -115,17 +131,35 @@ is not in frame.
 On `POST /direct`:
 
 1. Detection runs **immediately** (starts on "go", no initial pause).
-2. During the pause between calls the car keeps driving the **last commanded**
-   direction.
-3. The pause is adaptive: while the target is far, calls run every
-   `CONTROL_INTERVAL` (default 5s). Once the target's bounding box covers ≥
-   `SHORT_INTERVAL_AREA` (default 0.15) of the frame, the cadence tightens to
-   `SHORT_INTERVAL` (default 1s) for precise final alignment — same per-call
-   cost, ~5× more steering updates near the target.
-4. Exit conditions (checked on detection cycles):
+2. The **perception thread** paces model calls. Its pause is adaptive: while
+   the target is far, calls run every `CONTROL_INTERVAL` (default 5s). Once the
+   box covers ≥ `SHORT_INTERVAL_AREA` (default 0.15) of the frame, the cadence
+   tightens to `SHORT_INTERVAL` (default 1s) for final alignment. This pause is
+   purely a **cost governor** — it no longer limits how often the car steers.
+3. The **control thread** re-steers every `1/CONTROL_HZ` (default 10 Hz) from
+   the freshest box, regardless of what perception is doing.
+4. **Staleness deadman.** If the freshest box is older than
+   `max(STALE_MIN, STALE_FACTOR × measured perception cycle)`, the control
+   thread cuts the motors and reports `status="stale"`, leaving navigation
+   running so it resumes the moment a box arrives. The window is scaled off the
+   *measured* cycle so a deliberately slow cadence never trips it, while a hung
+   request trips it within a couple of cycles. `/status` reports the live value
+   as `stale_after`.
+5. Exit conditions:
    - **arrived** — bounding box covers ≥ 50% of the frame → stop.
-   - **target_lost** — no detection for 3 consecutive cycles → stop.
+   - **target_lost** — no detection for 3 consecutive perception cycles → stop.
+     Camera and API errors count as misses, so a persistent failure ends the
+     run rather than looping forever; the message lands in `status.error`.
    - **manual stop** — `POST /stop`.
+
+Restarting with a new target bumps an epoch counter that orphans the previous
+pair of threads, so a slow in-flight call from the old run can never write a
+throttle for the new one.
+
+For live driving you likely want a much tighter perception cadence than the
+cost-conservative default — set `CONTROL_INTERVAL=0` to poll as fast as model
+latency allows (this is what the old `http-poll` mode did), and budget
+accordingly.
 
 ## Steering math
 
@@ -146,7 +180,7 @@ On `POST /direct`:
 | GET | `/` | Web UI (MJPEG preview + controls) |
 | POST | `/direct` | Body `{"target": "the red ball"}` — start the control loop |
 | POST | `/stop` | Stop the car and the loop |
-| GET | `/status` | Loop state: running/target/status/cycle/last command/mock |
+| GET | `/status` | Loop state: running/target/status/error, `cycle` (perception) vs `control_cycle` (steering), `detection_age`, `stale_after`, last command, mock |
 | GET | `/video` | MJPEG camera stream (free preview, no inference) — overlays the live frame number, and highlights `INFER RAN HERE` on the exact frame the control loop used, plus the last inferred box |
 | GET | `/debug/scenarios` | List scripted fake scenarios |
 | POST | `/debug/scenario` | Body `{"name": "approach"}` — load a scripted scenario (mock only) |
@@ -168,9 +202,12 @@ Debug endpoints return `400` when the providers are not fake.
 | `DRIVER` | `fake` | `fake` or `tb6612` (`l298n` accepted as an alias) |
 | `VISION_MAX_TOKENS` | `128` | Small response limit for bounding-box JSON |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | Frame resolution |
-| `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far |
+| `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far; `0` polls as fast as model latency allows |
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
 | `SHORT_INTERVAL_AREA` | `0.15` | Box area fraction (of the 1000×1000 frame) that triggers the fast cadence |
+| `CONTROL_HZ` | `10` | Steering updates per second, independent of inference cadence |
+| `STALE_FACTOR` | `2.5` | Motors cut once the freshest box is this many measured perception cycles old |
+| `STALE_MIN` | `1.0` | Floor for the staleness window, in seconds |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
 | `TB6612_AIN1`…`TB6612_STBY` | see `.env.example` | GPIO pins for the dual TB6612FNG (SparkFun) |
 | `TB6612_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |
@@ -182,9 +219,12 @@ Debug endpoints return `400` when the providers are not fake.
 ```
 
 Covers the steering math (`test_controller.py`), the lenient JSON box
-parsing used in real mode (`test_vision.py`), the adaptive pause and
-inference-overlay state (`test_server.py`), and per-frame camera counters
-(`test_camera.py`). No network, no API usage.
+parsing used in real mode (`test_vision.py`), and per-frame camera counters
+(`test_camera.py`). `test_server.py` covers the adaptive pause, the
+inference-overlay state, and the perception/control split: that steering
+outpaces a slow model, that the deadman cuts the motors when a call hangs,
+that arrival ends the run, and that nothing drives the motors after a stop.
+No network, no API usage.
 
 ## Running on the Pi
 
@@ -203,9 +243,10 @@ export TB6612_STBY=21
 (picamera2 is arm/Linux-only). The mapping follows the SparkFun handoff:
 **Motor A = left wheel** (AIN1=17, AIN2=27, PWMA=13; forward=A IN2/GPIO 27),
 **Motor B = right wheel** (BIN1=16, BIN2=20, PWMB=12; forward=B IN1/GPIO 16),
-and **STBY=21**. The car drives slowly (the loop is paced by API
-latency + `CONTROL_INTERVAL`), so allow plenty of room. Point the web UI at
-the Pi's LAN address and the video preview shows the car's view.
+and **STBY=21**. Perception is paced by API latency + `CONTROL_INTERVAL` while
+steering runs at `CONTROL_HZ`, so the car keeps moving between model calls —
+allow plenty of room and start slow. Point the web UI at the Pi's LAN address
+and the video preview shows the car's view.
 
 ## Benchmarks
 
@@ -237,6 +278,8 @@ Local cost is a rounding error: the control loop's latency is entirely
 | 1.0 s | ~1030 ms | 6.000 s | 2.000 s | 30 |
 | 2.0 s | ~2029 ms | 7.000 s | 3.000 s | 20 |
 
-Steady-state cadence is exactly `pause + api` (no jitter), so with a real
-~1–2 s API round trip the car gets 20–40 steering updates per minute during
-final approach instead of ~10.
+Steady-state cadence is exactly `pause + api` (no jitter). These numbers
+predate the perception/control split and now describe the **perception**
+cadence — i.e. how often a *new box* arrives, and therefore what you spend.
+Steering updates are no longer tied to it: they run at `CONTROL_HZ` (default
+10 Hz = 600/min) off whichever box is freshest.

@@ -14,7 +14,7 @@ from camera import CameraProvider, FakeCamera, make_camera
 from controller import command
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
-from vision import FakeVision, VisionProvider, is_mock, make_vision
+from vision import DetectedObject, FakeVision, VisionProvider, is_mock, make_vision
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -38,7 +38,19 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _blank_infer() -> dict:
+    return {"count": 0, "frame_no": None, "label": None, "box_2d": None}
+
+
 class ControlLoop:
+    """Perception and steering run on separate threads.
+
+    A model call takes seconds; steering must not. The perception thread
+    publishes the freshest box it can get, and the control thread steers off
+    that box at a fixed rate, cutting the motors whenever the box is older
+    than the observed perception cycle can account for.
+    """
+
     def __init__(self, camera: CameraProvider, vision: VisionProvider, driver: Driver):
         self._camera = camera
         self._vision = vision
@@ -46,41 +58,56 @@ class ControlLoop:
         self._interval = _env_float("CONTROL_INTERVAL", 5.0)
         self._short_interval = _env_float("SHORT_INTERVAL", 1.0)
         self._short_interval_area = _env_float("SHORT_INTERVAL_AREA", 0.15)
+        self._control_period = 1.0 / max(_env_float("CONTROL_HZ", 10.0), 0.1)
+        self._stale_factor = _env_float("STALE_FACTOR", 2.5)
+        self._stale_min = _env_float("STALE_MIN", 1.0)
         self._miss_limit = 3
         self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
+        self._epoch = 0
+        self._latest: Optional[DetectedObject] = None
+        self._latest_at: Optional[float] = None
+        self._cycle_time: Optional[float] = None
         self.state = {
             "running": False,
             "target": None,
             "status": "idle",
             "cycle": 0,
+            "control_cycle": 0,
             "missed": 0,
+            "error": None,
+            "detection_age": None,
             "last_command": None,
-            "infer": {"count": 0, "frame_no": None, "label": None, "box_2d": None},
+            "infer": _blank_infer(),
         }
 
     def start(self, target: str) -> None:
         self._driver.stop()
         self._vision.start(target)
         with self._lock:
-            self.state["target"] = target
-            self.state["running"] = True
-            self.state["status"] = "starting"
-            self.state["cycle"] = 0
-            self.state["missed"] = 0
-            self.state["last_command"] = None
-            self.state["infer"] = {
-                "count": 0,
-                "frame_no": None,
-                "label": None,
-                "box_2d": None,
-            }
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
+            self._epoch += 1
+            epoch = self._epoch
+            self._latest = None
+            self._latest_at = None
+            self._cycle_time = None
+            self.state.update(
+                running=True,
+                target=target,
+                status="acquiring",
+                cycle=0,
+                control_cycle=0,
+                missed=0,
+                error=None,
+                detection_age=None,
+                last_command=None,
+                infer=_blank_infer(),
+            )
+        for worker in (self._perceive, self._control):
+            threading.Thread(target=worker, args=(epoch,), daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
+            # Orphans the current workers so a restart never races them.
+            self._epoch += 1
             self.state["running"] = False
             self.state["status"] = "stopped"
         self._driver.stop()
@@ -88,55 +115,105 @@ class ControlLoop:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return dict(self.state)
+            snap = dict(self.state)
+            snap["stale_after"] = round(self._stale_after(), 3)
+            return snap
 
     def _pause(self, area_fraction: Optional[float]) -> float:
         if area_fraction is not None and area_fraction >= self._short_interval_area:
             return self._short_interval
         return self._interval
 
-    def _run(self) -> None:
-        last_area: Optional[float] = None
-        while self._is_running():
-            frame = self._camera.read()
-            frame_no = self._camera.frame_no
-            with self._lock:
-                target = self.state["target"]
+    def _stale_after(self) -> float:
+        """Seconds a box stays usable. Caller holds the lock.
 
+        Scaled off the measured perception cycle so the deadman catches a hung
+        model call without firing on a cadence the operator chose deliberately.
+        """
+        cycle = self._cycle_time if self._cycle_time is not None else self._interval
+        return max(self._stale_min, self._stale_factor * cycle)
+
+    def _owns(self, epoch: int) -> bool:
+        """Whether this worker still drives the car. Caller holds the lock."""
+        return self.state["running"] and self._epoch == epoch
+
+    def _active(self, epoch: int) -> bool:
+        with self._lock:
+            return self._owns(epoch)
+
+    def _finish(self, status: str, epoch: int) -> None:
+        with self._lock:
+            if not self._owns(epoch):
+                return
+            self.state["running"] = False
+            self.state["status"] = status
+        self._driver.stop()
+        self._vision.stop()
+
+    def _perceive(self, epoch: int) -> None:
+        area: Optional[float] = None
+        previous_finish: Optional[float] = None
+        while self._active(epoch):
+            frame_no = None
+            error = None
+            detection = None
             try:
+                frame = self._camera.read()
+                frame_no = self._camera.frame_no
+                with self._lock:
+                    target = self.state["target"]
                 detection = self._vision.detect(target or "", frame)
             except Exception as exc:
-                detection = None
-                with self._lock:
-                    self.state["status"] = f"error: {exc}"
+                error = str(exc)
 
+            now = time.monotonic()
             with self._lock:
+                if not self._owns(epoch):
+                    return
+                if previous_finish is not None:
+                    self._cycle_time = now - previous_finish
                 self.state["cycle"] += 1
+                self.state["error"] = error
                 infer = self.state["infer"]
                 infer["count"] += 1
                 infer["frame_no"] = frame_no
                 infer["label"] = detection.label if detection else None
-                infer["box_2d"] = (
-                    list(detection.box_2d) if detection else None
-                )
-
-            if detection is None:
-                with self._lock:
+                infer["box_2d"] = list(detection.box_2d) if detection else None
+                if detection is None:
                     self.state["missed"] += 1
-                    if self.state["missed"] >= self._miss_limit:
-                        self.state["running"] = False
-                        self.state["status"] = "target_lost"
-                if not self._is_running():
-                    self._driver.stop()
-                    self._vision.stop()
-                    break
-            else:
-                with self._lock:
+                else:
                     self.state["missed"] = 0
+                    self._latest = detection
+                    self._latest_at = now
+                lost = self.state["missed"] >= self._miss_limit
+            previous_finish = now
+
+            if lost:
+                self._finish("target_lost", epoch)
+                return
+            if detection is not None:
+                area = command(detection.box_2d).area_fraction
+            time.sleep(self._pause(area))
+
+    def _control(self, epoch: int) -> None:
+        while self._active(epoch):
+            now = time.monotonic()
+            with self._lock:
+                if not self._owns(epoch):
+                    return
+                detection = self._latest
+                age = None if self._latest_at is None else now - self._latest_at
+                fresh = age is not None and age <= self._stale_after()
+                self.state["control_cycle"] += 1
+                self.state["detection_age"] = None if age is None else round(age, 3)
+
+            if detection is not None and fresh:
                 cmd = command(detection.box_2d)
-                last_area = cmd.area_fraction
                 self._driver.apply(cmd.left, cmd.right)
                 with self._lock:
+                    if not self._owns(epoch):
+                        return
+                    self.state["status"] = cmd.status
                     self.state["last_command"] = {
                         "left": round(cmd.left, 3),
                         "right": round(cmd.right, 3),
@@ -146,19 +223,18 @@ class ControlLoop:
                         "box_2d": list(detection.box_2d),
                         "area_fraction": round(cmd.area_fraction, 3),
                     }
-                    self.state["status"] = cmd.status
-                    if cmd.status == "arrived":
-                        self.state["running"] = False
                 if cmd.status == "arrived":
-                    self._driver.stop()
-                    self._vision.stop()
-                    break
+                    self._finish("arrived", epoch)
+                    return
+            else:
+                self._driver.stop()
+                with self._lock:
+                    if not self._owns(epoch):
+                        return
+                    self.state["status"] = "acquiring" if age is None else "stale"
+                    self.state["last_command"] = None
 
-            time.sleep(self._pause(last_area))
-
-    def _is_running(self) -> bool:
-        with self._lock:
-            return self.state["running"]
+            time.sleep(self._control_period)
 
 
 def _build_app(env: Optional[dict] = None):
