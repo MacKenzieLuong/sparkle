@@ -234,12 +234,17 @@ def test_motors_cut_when_detection_goes_stale():
         )
         loop.start("ball")
         _wait_until(lambda: driver.last != (0.0, 0.0), "car never started driving")
+        # Wait on the status, not the throttle: the control thread stops the
+        # motors first and records why second, so the throttle reaching zero
+        # does not yet mean the state has caught up.
         _wait_until(
-            lambda: driver.last == (0.0, 0.0), "motors never cut on a stale detection"
+            lambda: loop.snapshot()["status"] == "stale",
+            "motors never cut on a stale detection",
         )
         snap = loop.snapshot()
         loop.stop()
 
+    assert driver.last == (0.0, 0.0)
     assert snap["status"] == "stale"
     assert snap["running"] is True, "a stale box stops the motors, not the navigation"
 
