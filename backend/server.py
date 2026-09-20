@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import re
+import uuid
+from contextlib import asynccontextmanager
 import threading
 import time
 from pathlib import Path
@@ -8,7 +12,9 @@ from typing import Optional
 
 import cv2
 
-from pydantic import BaseModel
+from fastapi import Request
+from pydantic import BaseModel, Field
+from speech import SpeechService, validate_wav, MAX_BYTES, REJECTION
 
 import controller
 from camera import CameraProvider, FakeCamera, make_camera
@@ -38,7 +44,19 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 class DirectRequest(BaseModel):
-    target: str
+    target: str = Field(min_length=1, max_length=200)
+    commandId: Optional[str] = Field(default=None, max_length=100)
+    sessionId: Optional[str] = Field(default=None, max_length=100)
+    expectedRevision: Optional[int] = None
+    resume: bool = False
+
+
+class ResumeRequest(BaseModel):
+    expectedRevision: int
+
+
+class SessionRequest(BaseModel):
+    sessionId: str = Field(min_length=1, max_length=100)
 
 
 class ScenarioRequest(BaseModel):
@@ -107,8 +125,11 @@ class ControlLoop:
         # Last resort: if the network drops, /stop is unreachable and nothing
         # else bounds a drive that never arrives.
         self._max_run_seconds = _env_float("MAX_RUN_SECONDS", 120.0)
-        self._lock = threading.Lock()
+        self._lease_seconds = max(1.0, _env_float("HEARTBEAT_TIMEOUT", 3.0))
+        self._lock = threading.RLock()
         self._epoch = 0
+        self._heartbeat = time.monotonic()
+        self._receipts = {}
         self._latest: Optional[DetectedObject] = None
         self._latest_at: Optional[float] = None
         self._cycle_time: Optional[float] = None
@@ -152,14 +173,32 @@ class ControlLoop:
             "model_age": None,
             "last_command": None,
             "infer": _blank_infer(),
+            "command_id": None,
+            "session_id": None,
+            "revision": 0,
+            "paused": False,
         }
 
-    def start(self, target: str) -> None:
-        self._driver.stop()
-        self._vision.start(target)
+    def start(self, target: str, command_id=None, session_id=None,
+              expected_revision=None, resume=False) -> bool:
         with self._lock:
+            if command_id and command_id in self._receipts:
+                receipt = self._receipts[command_id]
+                if receipt["target"] != target or receipt["session_id"] != session_id:
+                    raise ValueError("command_id_conflict")
+                return True
+            if session_id and self.state["running"]:
+                raise ValueError("robot_busy")
+            if expected_revision is not None and expected_revision != self.state["revision"]:
+                raise ValueError("stale_command")
+            if session_id and self.state["paused"] and not resume:
+                raise ValueError("resume_required")
             self._epoch += 1
             epoch = self._epoch
+            self._driver.stop()
+            self._vision.stop()
+            self._vision.start(target)
+            self._heartbeat = time.monotonic()
             self._latest = None
             self._latest_at = None
             self._cycle_time = None
@@ -192,7 +231,12 @@ class ControlLoop:
                 model_age=None,
                 last_command=None,
                 infer=_blank_infer(),
+                command_id=command_id,
+                session_id=session_id,
+                revision=self.state["revision"] + 1,
+                paused=False,
             )
+            self._save_receipt()
         for index in range(self._concurrency):
             threading.Thread(
                 target=self._perceive, args=(epoch, index), daemon=True
@@ -200,15 +244,48 @@ class ControlLoop:
         threading.Thread(target=self._control, args=(epoch,), daemon=True).start()
         if self._track_enabled:
             threading.Thread(target=self._track, args=(epoch,), daemon=True).start()
+        return False
 
-    def stop(self) -> None:
+    def _save_receipt(self):
+        cid = self.state["command_id"]
+        if cid:
+            self._receipts[cid] = {key: self.state[key] for key in
+                                   ("command_id", "target", "session_id", "status", "running")}
+            if len(self._receipts) > 200:
+                del self._receipts[next(iter(self._receipts))]
+
+    def receipt(self, command_id):
         with self._lock:
-            # Orphans the current workers so a restart never races them.
+            result = self._receipts.get(command_id)
+            return dict(result) if result else None
+
+    def stop(self, status="stopped") -> None:
+        with self._lock:
             self._epoch += 1
             self.state["running"] = False
-            self.state["status"] = "stopped"
-        self._driver.stop()
-        self._vision.stop()
+            self.state["status"] = status
+            self.state["paused"] = True
+            self.state["revision"] += 1
+            self._driver.stop()
+            self._vision.stop()
+            self._save_receipt()
+
+    def resume(self, expected_revision):
+        with self._lock:
+            if self.state["running"] or self.state["revision"] != expected_revision:
+                raise ValueError("stale_command")
+            self.state.update(paused=False, status="idle", revision=self.state["revision"] + 1)
+
+    def heartbeat(self, session_id):
+        with self._lock:
+            if self.state["session_id"] == session_id:
+                self._heartbeat = time.monotonic()
+
+    def check_watchdog(self):
+        with self._lock:
+            if (self.state["running"] and self.state["session_id"]
+                    and time.monotonic() - self._heartbeat > self._lease_seconds):
+                self.stop("connection_lost")
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -253,8 +330,11 @@ class ControlLoop:
                 return
             self.state["running"] = False
             self.state["status"] = status
-        self._driver.stop()
-        self._vision.stop()
+            self.state["paused"] = status != "arrived"
+            self.state["revision"] += 1
+            self._driver.stop()
+            self._vision.stop()
+            self._save_receipt()
 
     def _publish(
         self,
@@ -508,10 +588,10 @@ class ControlLoop:
                         "area_fraction": round(cmd.area_fraction, 3),
                     }
             else:
-                self._driver.stop()
                 with self._lock:
                     if not self._owns(epoch):
                         return
+                    self._driver.stop()
                     self.state["status"] = "acquiring" if age is None else "stale"
                     self.state["last_command"] = None
 
@@ -554,14 +634,103 @@ def _build_app(env: Optional[dict] = None):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import FileResponse, StreamingResponse
 
-    scene = SCENARIOS["center"]
+    scene = FakeScene(boxes=list(SCENARIOS[os.getenv("FAKE_SCENARIO", "center")].boxes))
     camera = make_camera(scene)
     vision = make_vision(scene)
     driver = make_driver()
     loop = ControlLoop(camera, vision, driver)
+    speech = SpeechService()
+    instance_id = str(uuid.uuid4())
     print(_banner(camera, vision, driver, loop), flush=True)
 
-    app = FastAPI(title="RC Car Pilot")
+    async def watchdog():
+        while True:
+            loop.check_watchdog()
+            await asyncio.sleep(0.1)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        task = asyncio.create_task(watchdog())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            loop.stop()
+            await speech.close()
+            release = getattr(camera, "release", None)
+            if release:
+                release()
+
+    app = FastAPI(title="RC Car Pilot", lifespan=lifespan)
+    app.state.loop = loop
+    app.state.speech = speech
+
+    @app.get("/capabilities")
+    def capabilities():
+        return {**speech.capabilities(), "commandReceipts": True, "heartbeatSeconds": 1}
+
+    @app.post("/voice/interpret")
+    async def interpret(request: Request):
+        request_id = request.headers.get("x-request-id", "")
+        if not request_id or len(request_id) > 100:
+            raise HTTPException(422, {"code": "invalid_request_id"})
+        if not speech.configured:
+            raise HTTPException(503, {"code": "speech_unavailable", "requestId": request_id})
+        if request.headers.get("content-type", "").split(";")[0] not in ("audio/wav", "audio/x-wav"):
+            raise HTTPException(415, {"code": "unsupported_audio", "requestId": request_id})
+        if speech._busy.locked():
+            raise HTTPException(409, {"code": "speech_busy", "requestId": request_id})
+        async with speech._busy:
+            data = bytearray()
+            try:
+                async def read_audio():
+                    async for part in request.stream():
+                        data.extend(part)
+                        if len(data) > MAX_BYTES:
+                            raise OverflowError()
+                await asyncio.wait_for(read_audio(), timeout=15)
+            except OverflowError:
+                raise HTTPException(413, {"code": "audio_too_large", "requestId": request_id})
+            except (asyncio.TimeoutError, TimeoutError):
+                raise HTTPException(408, {"code": "upload_timeout", "requestId": request_id})
+            try:
+                validate_wav(bytes(data))
+            except OverflowError:
+                raise HTTPException(413, {"code": "audio_too_long", "requestId": request_id})
+            except ValueError:
+                raise HTTPException(422, {"code": "invalid_audio", "requestId": request_id})
+            try:
+                result = await asyncio.wait_for(speech.interpret(bytes(data)), timeout=30)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise HTTPException(504, {"code": "speech_timeout", "requestId": request_id})
+            except Exception as exc:
+                detail = {"code": "speech_provider_error", "requestId": request_id}
+                upstream_status = getattr(exc, "status_code", None)
+                if isinstance(upstream_status, int) and 400 <= upstream_status <= 599:
+                    detail["upstreamStatus"] = upstream_status
+                upstream_code = getattr(exc, "code", None)
+                if isinstance(upstream_code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", upstream_code):
+                    detail["upstreamCode"] = upstream_code
+                raise HTTPException(503, detail) from None
+        return {"requestId": request_id, **result.model_dump(),
+                "message": REJECTION if result.intent == "reject" else None,
+                "simulated": speech.provider == "fake"}
+
+    @app.post("/heartbeat")
+    def heartbeat(req: SessionRequest):
+        loop.heartbeat(req.sessionId)
+        return {"ok": True}
+
+    @app.get("/commands/{command_id}")
+    def receipt(command_id: str):
+        result = loop.receipt(command_id)
+        if result is None:
+            raise HTTPException(404, "unknown_command")
+        return result
 
     def _ensure_fake() -> FakeScene:
         if not isinstance(camera, FakeCamera) or not isinstance(vision, FakeVision):
@@ -576,20 +745,28 @@ def _build_app(env: Optional[dict] = None):
     def direct(req: DirectRequest):
         if not req.target.strip():
             raise HTTPException(400, "target is required")
-        loop.start(req.target.strip())
-        return {"started": True, "target": req.target.strip()}
-
-    @app.on_event("shutdown")
-    def shutdown() -> None:
-        loop.stop()
-        release = getattr(camera, "release", None)
-        if release:
-            release()
+        if req.sessionId and (not req.commandId or req.expectedRevision is None):
+            raise HTTPException(422, "session commands require commandId and expectedRevision")
+        try:
+            duplicate = loop.start(req.target.strip(), req.commandId, req.sessionId,
+                                   req.expectedRevision, req.resume)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        return {"started": True, "target": req.target.strip(), "commandId": req.commandId,
+                "duplicate": duplicate}
 
     @app.post("/stop")
     def stop():
         loop.stop()
         return {"stopped": True}
+
+    @app.post("/resume")
+    def resume(req: ResumeRequest):
+        try:
+            loop.resume(req.expectedRevision)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        return {"resumed": True}
 
     @app.get("/status")
     def status():
@@ -600,6 +777,7 @@ def _build_app(env: Optional[dict] = None):
             else None
         )
         snap["mock"] = is_mock()
+        snap["instance_id"] = instance_id
         snap["vision_mode"] = "fake" if is_mock() else "http"
         if isinstance(vision, OmniVision):
             snap["spend"] = {

@@ -1,8 +1,12 @@
-export function CameraView({ connected, target, unavailable = false }: { unavailable?: boolean; connected: boolean; target: string | null }) {
+import { useState } from 'react'
+
+export function CameraView({ connected, target, unavailable = false, mock = true }: { mock?: boolean; unavailable?: boolean; connected: boolean; target: string | null }) {
+  const [failed, setFailed] = useState(false)
+  const [attempt, setAttempt] = useState(0)
   return <section className="camera-panel" aria-labelledby="camera-title">
     <div className="panel-heading"><h2 id="camera-title"><span className="section-number">01</span> CAMERA VIEW</h2><span>CAM_01 / FRONT</span></div>
     <div className="camera-stage">
-      {connected ? <>
+      {connected && !mock ? (failed ? <div className="connection-empty"><span className="disconnect-symbol">×</span><h3>Camera unavailable</h3><p>Navigation can continue.</p><button onClick={() => { setFailed(false); setAttempt(attempt + 1) }}>Retry camera</button></div> : <img className="camera-stream" src={`/video?attempt=${attempt}`} alt="Live robot camera" onError={() => setFailed(true)} />) : connected ? <>
         <div className="camera-caption"><span className="outline-tag">SIMULATED VIEW</span><span>640 × 480</span></div>
         <svg className="scene" viewBox="0 0 800 480" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Illustrated mock camera view of a flag in an empty room">
           <g stroke="currentColor" strokeWidth="1" vectorEffect="non-scaling-stroke">
@@ -13,8 +17,8 @@ export function CameraView({ connected, target, unavailable = false }: { unavail
           </g>
         </svg>
         <div className="camera-bottom"><span>ILLUSTRATION / NO LIVE CAMERA</span><span>+ 00.000 / 00.000</span></div>
-      </> : <div className="connection-empty"><span className="disconnect-symbol">×</span><h3>{unavailable ? 'Live connection is not configured' : 'Lost connection'}</h3><p>{unavailable ? 'Camera feed unavailable.' : 'Navigation paused. Waiting for the robot.'}</p></div>}
+      </> : <div className="connection-empty"><span className="disconnect-symbol">×</span><h3>{unavailable ? 'Robot connection unavailable' : 'Lost connection'}</h3><p>{unavailable ? 'Camera feed unavailable.' : 'Navigation paused. Waiting for the robot.'}</p></div>}
     </div>
-    <div className="camera-foot"><span className="square" /><span>{unavailable ? 'Camera unavailable' : connected ? 'Mock camera ready' : 'Stream suspended'}</span><span className="camera-target">TARGET / {target ?? '—'}</span></div>
+    <div className="camera-foot"><span className="square" /><span>{unavailable ? 'Camera unavailable' : connected ? (mock ? 'Mock camera ready' : failed ? 'Camera unavailable' : 'Camera stream') : 'Stream suspended'}</span><span className="camera-target">TARGET / {target ?? '—'}</span></div>
   </section>
 }

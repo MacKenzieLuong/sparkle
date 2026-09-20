@@ -4,6 +4,7 @@ numpy
 opencv-python-headless
 openai
 websockets>=15,<17
+httpx
 pytest
 picamera2; sys_platform == "linux"
 gpiozero; sys_platform == "linux"

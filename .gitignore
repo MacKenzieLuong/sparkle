@@ -25,3 +25,8 @@ __pycache__/
 /frontend/**/*.njsproj
 /frontend/**/*.sln
 /frontend/**/*.sw?
+
+# Python generated files
+__pycache__/
+.pytest_cache/
+*.pyc

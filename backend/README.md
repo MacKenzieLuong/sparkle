@@ -688,3 +688,37 @@ predate the perception/control split and now describe the **perception**
 cadence — i.e. how often a *new box* arrives, and therefore what you spend.
 Steering updates are no longer tied to it: they run at `CONTROL_HZ` (default
 10 Hz = 600/min) off whichever box is freshest.
+
+## Laptop voice integration
+
+The React dashboard records a completed WAV clip and uses these routes through its Vite proxy:
+
+| Method | Path | Contract |
+| --- | --- | --- |
+| GET | `/capabilities` | Voice provider, WAV format, 10-second limit, stop/resume phrases, receipt support |
+| POST | `/voice/interpret` | Raw mono PCM16 WAV with `Content-Type: audio/wav` and `X-Request-ID`; returns transcript, intent, target, and reason |
+| POST | `/direct` | `{target, commandId, sessionId, expectedRevision, resume?}`; one active session command; 409 for busy, stale, or paused requests |
+| GET | `/commands/{commandId}` | Latest receipt for one of the last 200 accepted IDs, held in memory |
+| POST | `/heartbeat` | `{sessionId}`; dashboard sends every second; default lease expiry is 3 seconds |
+| POST | `/resume` | `{expectedRevision}`; clears an idle pause latch without starting movement |
+
+`/status` also returns `command_id`, `session_id`, `revision`, `paused`, and `instance_id` alongside perception and control state. Read the revision before dispatching. Repeated command IDs are deduplicated; a changed target or session under an existing ID is rejected. `/stop` invalidates late inference and motor writes. `resume:true` on `/direct` explicitly restarts an interrupted target. `target_lost`, `halted`, `time_limit`, and heartbeat expiry stop and pause the task. Arrival completes normally after consecutive confirmation.
+
+The legacy `{target}` direct request still works for the backend test page and can switch targets, but has no session heartbeat protection. Use the session contract for the React dashboard. The backend owns one active task; the browser owns the pending queue. This is a trusted local-network demo with no authentication or durable queue/receipt storage.
+
+`speech.py` reuses the existing OpenAI-compatible Chat Completions provider settings. It sends `input_audio` containing base64 WAV, requests text output, collects the HTTP response stream, and validates JSON. This is post-recording interpretation, not realtime microphone streaming. Voice requests run asynchronously, independently of perception and motor control. No audio is saved to disk.
+
+Audio is limited to 10 seconds and 2 MB, mono PCM16 at 8–48 kHz. Uploads have a 15-second timeout; interpretation has a 30-second timeout. HTTP errors distinguish busy (409), size/duration (413), media (415), invalid WAV/request (422), unavailable/provider failure (503), and provider timeout (504). Interpretation never directly moves the car. Ambiguous speech returns `intent: reject` and a retry message.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SPEECH_PROVIDER` | `fake` with `MOCK=true`, otherwise `qwen` | `fake`, `qwen`, or `disabled` |
+| `HUAWEI_VOICE_MODEL` | `HUAWEI_MODEL` or `qwen3.8-omni-flash` | Audio interpretation model |
+| `STOP_WORD` / `RESUME_WORD` | `stop` / `resume` | Standalone control phrases exposed to the browser |
+| `HEARTBEAT_TIMEOUT` | `3` | Session heartbeat timeout in seconds |
+| `FAKE_SCENARIO` | `center` | Initial fake vision scenario; `approach` for arrival demo |
+| `FAKE_VOICE_TRANSCRIPT` | `go to the blue flag` | Scripted fake speech fixture; ignores recording contents |
+
+To test real audio while keeping camera and motors fake, use `MOCK=true SPEECH_PROVIDER=qwen CAMERA=fake DRIVER=fake` with the provider key exported. Gateway audio compatibility and transcription accuracy must be checked with the actual account; automated tests stub the provider and spend no credits.
+
+From the repository root, run `backend/.venv/bin/python -m pytest backend -q`. With the fake backend and frontend dev server running, run `backend/.venv/bin/python backend/smoke_test.py --url http://127.0.0.1:5173` to verify HTTP/proxy communication without hardware. The heartbeat watchdog measures browser connectivity; `STALE_AFTER` stops driving when perception is too old, and `MAX_RUN_SECONDS` bounds the total run.

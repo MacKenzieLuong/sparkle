@@ -1,162 +1,166 @@
 # Autonomous RC Car MVP — Frontend Design
 
-## Goal and actual architecture
+## Goal and architecture
 
-Build a React + TypeScript + Vite laptop dashboard for a Raspberry Pi 5 RC car with Camera Module 3. The laptop and Pi share a hotspot. A user speaks a high-level navigation target; the dashboard sends it to the Pi, displays the camera view, and shows robot state.
-
-This design follows the **implemented backend** in `backend/server.py`. The backend uses HTTP for commands and status, plus HTTP/MJPEG for video. It has **no WebSocket server**. The frontend is currently a Vite starter, so the dashboard, microphone interaction, and API integration remain to be built.
-
-Perception is initiated by the Pi control loop: it reads the Pi camera, then calls `vision.detect(target, frame)`. With `MOCK=false`, the Pi sends a JPEG frame to a remote inference API. With `MOCK=true`, fake vision returns scripted detections. The laptop does not perform inference or send detections to the Pi in the current system.
+A React + TypeScript + Vite laptop dashboard controls a Raspberry Pi RC car on the same local network. The user records a navigation command; the backend obtains its transcript and meaning from Qwen, validates the result, and returns a structured intent. The browser owns the pending navigation queue. The Pi owns camera acquisition, perception requests, steering, and motor execution.
 
 ```text
-Speech -> browser recognition -> validated target -> POST /direct -> Pi
-Pi camera -> GET /video (MJPEG) -> browser
-Pi camera -> Pi vision call -> Pi steering -> motors
-Pi state -> GET /status (polling) -> browser
+Laptop microphone → PCM16 WAV → Vite proxy → Pi /voice/interpret
+Pi → Qwen Chat Completions → transcript + intent JSON → validation
+Validated intent → browser queue → Pi /direct → camera/vision/controller/motors
+Pi /video → Vite proxy → browser camera view
+Browser heartbeat + status polling ↔ Pi control loop
 ```
 
-The frontend must not calculate steering or throttle, control motors directly, perform detection, or encode the Pi camera stream.
+The HTTP audio, status, queue dispatch, proxy, and watchdog integration is implemented. Automated tests use fake providers; real gateway audio and physical hardware remain unverified. The layout-only mock is also retained.
 
-## Backend communication contract
+## AI responsibility and API style
 
-The Pi FastAPI server defaults to port `8000` (`HOST` and `PORT` are backend settings). Use a configurable host and port in the frontend.
+All transcription, language interpretation, prompts, provider credentials, and intent validation belong to the Python backend. Actual Qwen inference runs at the configured remote provider; model weights are not installed on the laptop or Pi. The frontend captures/encodes audio and displays results; it performs no production speech parsing, vision inference, steering, or throttle calculations.
 
-| Method | Path | Request | Response and meaning |
-| --- | --- | --- | --- |
-| `POST` | `/direct` | JSON `{"target":"blue flag"}` | `{"started":true,"target":"blue flag"}`. Starts or updates the control loop; a blank target returns HTTP 400. |
-| `POST` | `/stop` | No required body | `{"stopped":true}`. Stops the loop and driver. |
-| `GET` | `/status` | None | Current state snapshot as JSON. The client must poll. |
-| `GET` | `/video` | None | MJPEG response with media type `multipart/x-mixed-replace; boundary=frame`. |
+Both vision and speech use the existing OpenAI-compatible **Chat Completions** API via the OpenAI Python SDK. Default provider URL: `https://yibuapi.com/v1`. Default model: `qwen3.8-omni-flash`. `HUAWEI_VOICE_MODEL` can override the voice model independently. Keep the provider key on its corresponding endpoint.
 
-The backend also serves a test UI at `/` and mock-only `/debug/*` endpoints; the operator dashboard does not need those debug routes.
+Speech sends a completed WAV as base64 `input_audio`, requests text output, collects the streaming HTTP response, and validates JSON. `stream=True` streams the response; it does not make microphone capture realtime. Realtime access is not required for queued navigation. Voice uses async I/O independently of the threaded vision loop, with no shared conversation history.
 
-Example `/status` response shape:
+Reference: [Qwen-Omni HTTP documentation](https://www.alibabacloud.com/help/en/model-studio/qwen-omni). The actual sponsor gateway/account still needs a short audio compatibility check.
+
+## Browser recording and interpretation
+
+- First press requests microphone access and begins recording. Second press finishes and submits.
+- Recording automatically ends at **10 seconds**, enforced by audio sample counting and a timer fallback.
+- AudioWorklet captures mono PCM; the browser writes a complete PCM16 WAV (requested 16 kHz). No WebM conversion service or browser SpeechRecognition is used.
+- Mic tracks are released on completion, cancellation, disconnection, and unmount.
+- Show requesting, listening/countdown, processing, transcript, rejection, and error states.
+- Disable the mic during permission setup and processing. A new clip may start only after the previous result is handled; no arbitrary cooldown is needed. Although recording and an earlier HTTP request could technically overlap, this MVP deliberately allows only one at a time.
+- The backend independently allows one audio request at a time and returns HTTP 409 if busy.
+- Navigation already in progress continues while audio is recorded or processed. Rejected/failed clips add no task.
+- Discard results from canceled capture sessions. Deduplicate successful results by request ID.
+
+The backend requests one intent: `navigate`, `stop`, `resume`, or `reject`. Navigation requires a nonempty concrete object description, bounded to 200 characters. Flags are examples, not a fixed object enum; preserve details such as “small red ball.” The prompt rejects unclear audio, silence, ambiguous references, negative commands, multiple targets/commands, and unrelated speech. Strict schema validation rejects malformed model output; conservative transcript checks also reject selected ambiguous patterns. Model semantic accuracy still requires real recordings to evaluate.
+
+Unclear commands show: **“The transcription is unclear, so this command cannot be accepted. Please try again.”** No guessed navigation is queued.
+
+`STOP_WORD` and `RESUME_WORD` are backend settings, returned by `/capabilities`. These control phrases must match the standalone normalized transcript. The live frontend does not interpret keywords. The layout mock retains its own demo-only parser.
+
+Example result:
 
 ```json
 {
-  "running": true,
+  "requestId": "voice-123",
+  "transcript": "Go to the blue flag",
+  "intent": "navigate",
   "target": "blue flag",
-  "status": "moving",
-  "cycle": 2,
-  "missed": 0,
-  "last_command": {
-    "left": 0.35,
-    "right": 0.15,
-    "status": "moving",
-    "note": "dx 0.25, area 0.10",
-    "label": "blue flag",
-    "box_2d": [300, 600, 700, 850]
-  },
-  "driver": null,
-  "mock": false
+  "reason": null,
+  "message": null,
+  "simulated": false
 }
 ```
 
-`last_command` is initially `null`. `driver` is a fake-driver throttle pair in fake mode and `null` with the real driver. Expected status values include `idle`, `starting`, `moving`, `arrived`, `target_lost`, and `stopped`; inference exceptions may set a string beginning `error:`. `running` indicates whether the control loop is active. Treat fields defensively, including nulls and future additions.
+## HTTP contract
 
-The backend does **not** provide command IDs, acknowledgement events, structured error codes, Pi event timestamps, or decision events. An HTTP 200 from `/direct` means the request was accepted; it does not mean the target was detected or reached. Show recognition, HTTP request outcome, and later robot status as separate steps. If a command request times out or loses its response, show `Outcome unknown`, refresh `/status`, and do not automatically resubmit it. Without command IDs, a status snapshot cannot always resolve whether that particular request was accepted; hold subsequent dispatch while its outcome remains uncertain.
+The backend defaults to port 8000. There is no WebSocket server.
 
-## Navigation queue and backend semantics
+| Method | Path | Contract |
+| --- | --- | --- |
+| GET | `/capabilities` | `voiceMode` (clip/disabled), `speechProvider`, `maxRecordingSeconds:10`, `audioFormats`, stop/resume words, receipt support, heartbeat interval |
+| POST | `/voice/interpret` | Raw WAV body, `Content-Type: audio/wav`, `X-Request-ID` (1–100 chars). Returns the validated interpretation. Side-effect free: never starts/stops motors or edits a queue. |
+| POST | `/direct` | JSON `{target, commandId, sessionId, expectedRevision, resume?}`. Starts one task; returns `{started:true,target,commandId,duplicate}`. |
+| POST | `/stop` | Stops the loop/driver, increments revision, and sets the pause latch. Returns `{stopped:true}`. |
+| POST | `/resume` | `{expectedRevision}`. Clears an idle pause latch without movement; returns `{resumed:true}`. |
+| POST | `/heartbeat` | `{sessionId}`. Refreshes the active session lease. |
+| GET | `/commands/{commandId}` | Latest in-memory receipt: command_id, target, session_id, status, running. Unknown ID returns 404. |
+| GET | `/status` | Pollable snapshot; see below. |
+| GET | `/video` | HTTP MJPEG (`multipart/x-mixed-replace; boundary=frame`). |
 
-Navigation commands must run sequentially in arrival order. A command received while the robot is working joins the queue; it must not replace or interrupt the active target. Continue accepting valid navigation speech while another task is active. The frontend owns an in-memory queue and dispatches through `/direct` only when the previous task is confirmed finished. The existing backend has no queue: calling `/direct` while running replaces the target.
+Audio validation: mono PCM16 WAV, 8–48 kHz, at least 0.1 seconds, at most 10 seconds/2 MB, and complete frame data. Audio stays in request memory; no persistence. Upload timeout: 15 seconds. Interpretation timeout: 30 seconds. Provider client timeout: 25 seconds, with automatic SDK retries disabled.
 
-Voice stop pauses navigation and queue dispatch, preserving the interrupted target and all pending targets. Refreshing the page clears the frontend queue; it does not itself guarantee that a currently moving robot stops, because its control loop lives on the Pi. On page load, read `/status` before dispatching any new work. The backend has no resume endpoint: resuming the interrupted target requires sending it again through `/direct`. The explicit resume interaction and behavior after a failed task or connection loss remain to be confirmed. Never interpret `stopped` as permission to automatically dispatch the next queued target.
+Operational errors use FastAPI's `detail` envelope containing a `code` and, where valid, `requestId`: 408 upload timeout, 409 speech busy, 413 size/duration, 415 content type, 422 invalid WAV/request ID, 503 unavailable/provider failure, 504 interpretation timeout. Provider messages, request bodies, and credentials are not returned. A valid rejection differs from an operational error.
 
-`find` follows the existing backend detection behavior: there is no search maneuver. Three consecutive missed detections terminate the loop as `target_lost`. `arrived` follows the existing controller threshold: a detection bounding box covering at least 50% of the normalized image area stops the robot. Do not add a new search or distance-based arrival algorithm in the frontend.
-
-## Dashboard and component boundaries
-
-The dashboard should contain a live camera view, current target/state, backend reachability, a chronological state-change log, and a two-press microphone control. Keep API code out of presentational components. Suggested structure:
+`/status` includes:
 
 ```text
-src/
-  components/{CameraView,DecisionLog,RobotStatus,ConnectionStatus,PushToTalk}/
-  hooks/{useRobotStatus,usePushToTalk}.ts
-  services/{robotApi,speechRecognition}.ts
-  types/{robot,speech}.ts
-  config/environment.ts
-  mocks/mockRobot.ts
-  App.tsx
+running, target, status, cycle, missed, last_command,
+command_id, session_id, revision, paused, instance_id, driver, mock
 ```
 
-Use React hooks and native browser APIs. No manual driving, frontend motor controls, database, persistent logs, or object detection are needed for the MVP. Keep `CameraView` isolated so a future video transport change does not affect status and voice components.
+`last_command` is initially null, otherwise includes left/right throttle, status, note, label, and box_2d. `driver` is a throttle pair for the fake driver and null for physical hardware. Statuses include idle, starting, moving, arrived, target_lost, stopped, connection_lost, and error. `instance_id` changes on backend restart; receipts are not durable.
 
-## Configuration and browser networking
+Read the current revision before dispatch. Busy, stale-revision, or paused-without-resume requests return 409. Duplicate command IDs with the same target/session return an acknowledgement without restarting movement; conflicting reuse returns 409. The backend retains the most recent 200 accepted command IDs.
 
-Example frontend configuration:
+The legacy `/direct {target}` request remains for the backend test page. It has no session heartbeat protection. The React dashboard uses the full session contract. The demo assumes a trusted local network and has no authentication.
+
+## Queue, failures, and uncertain outcomes
+
+The browser owns an in-memory FIFO queue; the backend executes one active task. New navigation speech received while moving joins the queue. A direct call while busy is rejected rather than replacing the active target.
+
+Only a correlated successful `arrived` completion automatically advances the queue. `target_lost`, backend errors, unexpected stop, connection loss, and restart pause dispatch and preserve pending targets. Resume retries an interrupted target with a new command ID before pending tasks, using `resume:true` and the current revision. An empty paused queue uses `/resume` to become ready again.
+
+`find` uses existing backend detection behavior; there is no search maneuver. Three missed detections stop with `target_lost`. `arrived` follows the controller's existing bounding-box area threshold (at least 50% of normalized image area). The frontend adds no distance-based arrival logic.
+
+If a direct request loses its response or times out, display **Outcome unknown**, pause, refresh status, and look up its command receipt. Do not automatically resend it. A 404 receipt is not proof that a delayed request cannot still arrive. Recovered receipts leave the queue paused until explicit resume. If the outcome remains unresolved, stop before resuming. Backend restart invalidates prior receipt history and pauses the UI.
+
+Refresh clears the browser queue/log, creates a new session, and reads backend status before dispatch. It does not instantly stop an existing task; the old session lease expires if its page is gone. An active task belonging to another session is observed without taking over automatically.
+
+## Stop and connection handling
+
+Clip-based speech cannot recognize stop while audio is still being recorded. Recognition waits for capture, upload, and model processing. Once a validated stop result arrives, pause frontend dispatch immediately and call `/stop` outside the navigation queue. Preserve interrupted/pending tasks. Do not claim a stop succeeded if its HTTP outcome is uncertain.
+
+The backend increments a generation on stop and rechecks it before applying inference results. Revision checks reject stale dispatch; an explicit resume handshake clears the pause latch. Camera, inference, and controller exceptions stop the current task. Initialization creates one hardware/provider set.
+
+The frontend sends a heartbeat and polls status about once per second without overlapping polling cycles. The backend independently checks the active session lease every 0.1 seconds; default expiry is 3 seconds. On expiry it stops the driver and reports `connection_lost`. This watchdog does not wait for Qwen.
+
+On HTTP connection failure, retain the queue/log but pause dispatch, disable recording, remove the MJPEG image, and show a lost/unavailable connection screen. Retry polling automatically. Reconnection restores observability, never automatic movement. Heartbeat monitoring covers browser connectivity, not perception freshness or backend process failure.
+
+## Dashboard and camera
+
+Keep the white background, black straight borders, and monospace layout. Camera and mic occupy the left column; queue and a large scrolling status log occupy the right. Avoid the redundant control/robot-state/current-target bottom strip. No additional instructions in the corner.
+
+Live mode preserves the complete dashboard when unreachable: placeholder values, unavailable camera message, and disabled mic. It displays no layout-mock labels. When connected, `<img src="/video">` shows MJPEG with an unavailable/retry fallback. A camera-view error alone permits navigation to continue. A stream stall after loading cannot reliably be detected from image error events; per-frame freshness monitoring is outside this implementation.
+
+Log observed status changes and actions with the laptop response-receipt time. Keep at most 200 entries; retain them over disconnect and clear on refresh. Polling may miss intermediate transitions. These are frontend observations, not authoritative Pi event timestamps or a complete decision history.
+
+## Implemented structure
+
+```text
+frontend/src/
+  components/VoiceControl.tsx       live microphone UI
+  components/CameraView.tsx         illustration or MJPEG/error view
+  hooks/useRobotConnection.ts       React subscription/lifecycle
+  services/audioCapture.ts         microphone + WAV encoding
+  services/robotApi.ts              HTTP client and response checks
+  services/robotConnection.ts       queue, status, receipts, session lifecycle
+  types/api.ts                     wire contract
+frontend/public/pcm-recorder.js     bounded AudioWorklet recording
+frontend/vite.config.ts             API/video proxy
+backend/speech.py                   audio limits, Qwen adapter, strict intent validation
+backend/server.py                   routes, active task, receipt cache, pause/watchdog
+backend/vision.py                   existing image Chat Completions adapter
+backend/controller.py               existing deterministic steering math
+```
+
+## Configuration and launch
+
+Frontend `.env.local`:
 
 ```env
-VITE_MOCK_MODE=true
-VITE_ROBOT_HOST=192.168.1.24
-VITE_ROBOT_PORT=8000
-VITE_STOP_WORD=stop
+VITE_MOCK_MODE=false
+ROBOT_API_URL=http://127.0.0.1:8000
 ```
 
-Derive the API origin and `/video` URL in `config/environment.ts`. The current backend stream is `/video` on the same port as the API, not `/video_feed` on port 5000. Do not put the Pi IP in UI components; hotspot addresses may change.
+For the car, replace the URL with `http://<pi-address>:8000` and restart Vite. All API calls and `/video` use relative paths forwarded by Vite. Open the dashboard at localhost on the laptop for microphone access; a remote plain-HTTP dashboard would not be a secure microphone context. This development proxy avoids a CORS requirement. Production hosting is outside the MVP.
 
-For the laptop MVP, run Vite locally with `npm run dev` and open the dashboard on localhost. Configure its development proxy to forward `/direct`, `/stop`, `/status`, and `/video` to the configured Pi host and port. Frontend requests and the camera image use those relative paths through Vite. This avoids requiring backend CORS changes for the demo. The current Vite configuration does not yet implement this proxy. Select and test the actual laptop browser's speech recognition before the demo; production hosting is outside this MVP.
+Backend settings are exported shell variables; `.env` is not loaded automatically. `SPEECH_PROVIDER=fake|qwen|disabled` selects speech. `HUAWEI_API_KEY`, `HUAWEI_BASE_URL`, `HUAWEI_MODEL`, and optional `HUAWEI_VOICE_MODEL` stay backend-only. `MOCK` selects fake/real vision independently; `CAMERA` and `DRIVER` select hardware providers. See both READMEs and `.env.example` files for launch commands.
 
-Test that the hotspot permits laptop-to-Pi traffic and that video and status polling work simultaneously.
+Use `MOCK=true SPEECH_PROVIDER=fake CAMERA=fake DRIVER=fake FAKE_SCENARIO=approach` for local integration. Fake speech returns a labeled scripted transcript, regardless of the recording; it verifies transport only. Use `SPEECH_PROVIDER=qwen` with fake hardware to test actual audio safely before connecting motors. `VITE_MOCK_MODE=true` instead selects the standalone layout demo with editable text and no microphone/backend.
 
-## Camera view
+## Verification and remaining gates
 
-Use an `<img>` with the configured `/video` URL for MJPEG. Preserve aspect ratio. Show loading, unavailable, and retry states without crashing the rest of the dashboard. Handle image errors; note that a stalled stream after a successful load may require an additional health check because an `<img>` does not expose per-frame timestamps. Mock mode may show a local prerecorded video or placeholder. Do not send video through a command channel.
+Automated backend checks cover WAV validation, interpretation rejection, the Qwen request shape, direct/receipt correlation, deduplication, stale requests, watchdog behavior, and late inference after stop. Frontend checks cover queue order, failure pause/retry, uncertain responses, reconnection, and the 10-second sample limit. The local smoke test submits generated WAV through Vite, dispatches its interpreted target, maintains a heartbeat, and checks arrival/receipt using fake providers.
 
-A camera-view failure alone does not stop navigation or prevent queued navigation commands. Distinguish this from losing the robot connection: on robot connection loss, suspend the video request and replace the view with a `Lost connection` screen. MJPEG has no playback pause API, so suspend it by removing the image source and reconnect later. Camera recovery and robot connection recovery must be handled separately.
+Remaining real integration checks:
 
-## Voice grammar and request mapping
-
-First microphone press starts browser speech recognition; second press stops it and processes the transcript. Keep speech APIs behind `speechRecognition.ts`. Show listening state, transcript, interpreted target, unsupported-command feedback, microphone/browser errors, HTTP request outcome, and latest robot status.
-
-Stop is a voice command. Its keyword is configurable through `VITE_STOP_WORD`, initially `stop`, so it can be changed without editing the parser. Detect a standalone stop command while the microphone is listening and act as soon as it is recognized, without waiting for the second press. Pause local navigation dispatch immediately, preserve the interrupted and pending targets, and call `/stop` outside the queue. Suppress any pending navigation transcript from that listening session so it cannot restart movement after stop. Do not require stopping or clearing the camera preview for a voice pause. Recognition only operates during an active microphone session; this is not an always-listening stop detector.
-
-Recognize navigation verbs such as `go`, `drive`, `navigate`, `find`, `head`, and `move`, and extract a target description. Flags and colors in this document are examples/placeholders, not a confirmed vocabulary restriction. The backend accepts any nonblank target string, embeds it into a vision prompt, and uses the first parsed detection; it does not validate that the object is a flag or that a color belongs to an enum. Fake vision replays boxes regardless of target text. Confirm whether the frontend should accept general object descriptions or a configured target allowlist. Reject ambiguous speech such as “go over there,” negated commands, and conflicting targets; do not forward raw speech transcripts.
-
-For a flag example, the frontend can parse a target description and translate it to the **actual backend wire format**:
-
-```text
-"Go to the blue flag" -> { target: "blue flag" }
-                      -> POST /direct { "target": "blue flag" }
-```
-
-The API receives only the extracted text target. Keep any frontend vocabulary restrictions configurable once the supported targets are agreed.
-
-## Status, connection, and log
-
-Poll `/status` while the page is open. One second matches the backend test UI and is a starting interval. Avoid overlapping requests and cancel work on unmount. Display `connecting`, `connected`, or `disconnected` as **HTTP reachability**, not WebSocket state. On poll failure, retain the last status but visibly mark it stale; retry automatically with bounded backoff.
-
-When the robot connection is lost, the required behavior is to stop the car, suspend the stream, and show `Lost connection`. A frontend `/stop` request cannot guarantee delivery over a broken connection. The Pi needs a heartbeat/lease watchdog or equivalent local mechanism that stops the motors when the laptop stops checking in. That mechanism does not exist in the current backend. Define the connection-loss timeout and reconnection/queue-resume policy before implementing it. A working HTTP server also does not prove perception is healthy; detection staleness requires a separate backend check.
-
-The backend exposes snapshots, not a decision history. The frontend may log *observed state changes* and actions it initiated, such as command submitted, `starting`, `moving`, `arrived`, `target_lost`, `stopped`, and connection loss/restoration. Use laptop receipt time and label entries as frontend-observed. Do not claim they have Pi-generated timestamps or represent every robot decision: polling can miss intermediate transitions. Keep at most 200 entries, retain them across disconnects, and reset them on page refresh. Do not create a log entry for every poll or throttle change.
-
-For this MVP, observed state changes with the successful status response's laptop receipt timestamp are sufficient. Authoritative Pi decision events are not required.
-
-## Mock mode and tests
-
-`VITE_MOCK_MODE=true` must run without a Pi, physical camera, inference API, or WebSocket. A mock service should implement the same interface as `robotApi.ts` and return the same response/status shapes. Keep mock switching in the service or hook, not in presentational components. Exercise the real browser microphone where supported; simulate HTTP success and subsequent robot status changes for valid speech.
-
-Test startup with and without the Pi; status failure and recovery; malformed status responses; camera load failure while navigation continues; refresh; bounded logs; supported and unsupported speech; configurable stop keyword; voice stop bypassing queued tasks; commands received during navigation; unknown request outcomes without automatic resubmission; unsupported recognition APIs; microphone permission denial; second-press end of listening; and video plus polling plus real inference under hotspot load. Add connection-loss motor-stop and queue recovery tests once the missing backend behavior is implemented.
-
-## Robot-side gaps and decisions
-
-1. **Stop race:** an in-progress inference can currently finish and apply a motor command after `/stop`. The backend should recheck active state before applying a result.
-2. **Motor timeout:** the backend holds its last command through inference and the five-second default control interval. A separate motor failsafe is needed for stale or hung inference before physical operation.
-3. **Queue lifecycle:** the frontend owns the in-memory queue; voice stop pauses it and refresh clears it. Confirm the resume interaction and handling of failed tasks/disconnection. Successful tasks should advance in arrival order.
-4. **Connection-loss stop:** implement a Pi-local watchdog; specify its timeout and whether reconnection requires an explicit resume command.
-5. **Voice details:** confirm general target descriptions versus an allowlist, the resume command, and behavior when speech recognition ends before the second press. Voice stop acts immediately when recognized during listening.
-6. Confirm the Pi's reachable address and the laptop browser. Perception stays on the existing Pi-initiated path, and logs use frontend receipt timestamps.
-
-## MVP acceptance criteria
-
-- The dashboard displays `/video` and handles detectable camera failure.
-- It polls `/status`, shows target/state, marks status stale on disconnection, and recovers without clearing logs.
-- Robot connection loss stops the car through a Pi-local mechanism, suspends the stream, and shows `Lost connection`; camera-view failure alone permits navigation to continue.
-- Navigation commands received while moving queue in arrival order without replacing the active task.
-- The configurable voice stop keyword acts during listening, bypasses the queue, calls `/stop`, and preserves the paused queue. Refresh clears the in-memory queue.
-- The bounded log displays frontend-observed changes without presenting them as authoritative Pi decisions.
-- The microphone starts on the first press and stops on the second; transcript and errors are visible.
-- Supported speech yields a canonical text target sent through `POST /direct`; unsupported speech sends nothing.
-- The UI distinguishes local recognition, HTTP request result, and later robot state.
-- An uncertain command response shows `Outcome unknown` and refreshes status without automatic command resubmission.
-- Mock mode runs with `npm run dev` without robot services and uses the same UI and data shapes.
-- The frontend performs no steering, motor control, or object detection.
+1. Test a spoken WAV against the actual gateway/account and `qwen3.8-omni-flash`; inspect transcript/intent quality and latency. Stub tests cannot establish account access or transcription accuracy.
+2. Exercise microphone permission, actual recording, and playback-free capture in the intended laptop browser.
+3. Confirm the Pi address/port and hotspot connectivity; run video, polling, and audio together.
+4. Validate camera/motor hardware separately. Add a perception/motor freshness failsafe before physical driving: the current loop holds its last command during inference and the control interval. A heartbeat alone does not cover stale perception.
+5. Measure clip-based stop latency; do not promise immediate spoken stop.
