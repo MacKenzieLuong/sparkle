@@ -487,6 +487,25 @@ DRIVER=tb6612 CAMERA=rpicam .venv/bin/python calibrate.py
 | coast, deg after power is cut | a pivoting car keeps going; this is most of the overshoot |
 | deg per pixel | `dx` becomes a real angle |
 | forward speed, m/s | how far the car travels blind between confirmations |
+| straight-line trim | the two sides are not loaded equally, so equal throttle curves |
+| minimum throttle per side | the heavier side needs more PWM before it moves at all |
+
+### Uneven load
+
+The right side of this car carries more than the left. Two consequences, both
+corrected in `drive.py` rather than worked around in the controller:
+
+`MOTOR_LEFT_SCALE` / `MOTOR_RIGHT_SCALE` trim out the speed difference, so a
+commanded-straight drive goes straight. The trim experiment measures the
+heading change over a straight run and converts it, via the already-measured
+yaw rate, into the throttle difference that must have caused it. The faster
+side is scaled down rather than the slower one up, since the slower side has no
+headroom left at full throttle.
+
+`MOTOR_LEFT_MIN` / `MOTOR_RIGHT_MIN` lift small commands over the throttle at
+which each wheel starts turning. Below that a loaded motor sits humming while
+the other side drives, so the car swings instead of easing forward. A stop is
+never lifted — it reaches the motors as a stop.
 
 Yaw rate and coast come from one experiment run at two durations, since
 `angle(t) = rate * t + coast` solves for both. Degrees per pixel is measured

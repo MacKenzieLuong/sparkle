@@ -66,6 +66,14 @@ setting TURN_GAIN 0.3
 setting DEAD_ZONE 0.15
 setting SEARCH_SPEED 0.25
 
+# --- chassis trim (from calibrate.py) ---------------------------------------
+# The two sides are not loaded equally, so equal throttle does not drive
+# straight, and the heavier side needs more PWM before it moves at all.
+setting MOTOR_LEFT_SCALE 1.0
+setting MOTOR_RIGHT_SCALE 1.0
+setting MOTOR_LEFT_MIN 0.0
+setting MOTOR_RIGHT_MIN 0.0
+
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows
 setting CONTROL_HZ 10

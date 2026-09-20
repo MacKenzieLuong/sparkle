@@ -188,6 +188,109 @@ def measure_scale(driver, camera, pivots: dict) -> Optional[dict]:
     }
 
 
+def measure_stiction(driver) -> dict:
+    """The throttle at which each wheel actually starts turning.
+
+    A more heavily loaded side needs more PWM to break away, so small commands
+    move one wheel and not the other: the car swings instead of easing forward.
+    """
+    print("\n=== Minimum throttle per side ===")
+    print("Each wheel is ramped up on its own. Say when it starts turning.")
+    print("Lift that wheel clear of the floor so it is free to spin.")
+    results: dict[str, float] = {}
+
+    for side, (left_sign, right_sign) in (("left", (1, 0)), ("right", (0, 1))):
+        print(f"\n  {side} wheel:")
+        found: Optional[float] = None
+        for step in range(5, 100, 5):
+            throttle = step / 100.0
+            # Straight to _drive: conditioning is what is being measured.
+            driver._drive(left_sign * throttle, right_sign * throttle)
+            time.sleep(0.6)
+            try:
+                answer = input(f"    {throttle:.2f} — turning? [y/N/q] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                driver.stop()
+                print()
+                return results
+            if answer in ("q", "quit"):
+                driver.stop()
+                return results
+            if answer.startswith("y"):
+                found = throttle
+                break
+        driver.stop()
+        time.sleep(0.3)
+        if found is not None:
+            results[side] = found
+            print(f"    -> {side} breaks away at {found:.2f}")
+        else:
+            print(f"    -> {side} never moved; check wiring and battery")
+    return results
+
+
+def measure_trim(driver, pivots: dict) -> Optional[dict]:
+    """How much one side outruns the other when both are commanded equally.
+
+    An uneven chassis curves a commanded-straight drive. The drift is converted
+    into the throttle difference that would have caused it, using the yaw rate
+    already measured, and that difference becomes a per-side scale.
+    """
+    print("\n=== Straight-line trim ===")
+    print("The car drives with both sides commanded equally. Measure the heading")
+    print("it ends up on, compared with the one it started on.")
+
+    usable = {
+        float(d): v["deg_per_second"]
+        for d, v in pivots.items()
+        if v.get("deg_per_second")
+    }
+    if not usable:
+        print("  needs a yaw rate first; skipping")
+        return None
+    pivot_diff = min(usable)
+    # Pivoting at +d/-d is a difference of 2d between the sides.
+    deg_per_second_per_unit = usable[pivot_diff] / (2 * pivot_diff)
+
+    throttle = FORWARD_THROTTLES[0]
+    seconds = FORWARD_SECONDS
+    if not countdown(f"drive straight at {throttle} for {seconds}s", 3):
+        return None
+    pulse(driver, throttle, throttle, seconds)
+    time.sleep(0.8)
+
+    print("    positive = veered RIGHT, negative = veered LEFT")
+    drift = ask_float("degrees of heading change")
+    if drift is None or np.isnan(drift):
+        return None
+    if abs(drift) < 1.0:
+        print("    -> already straight; no trim needed")
+        return {"left_scale": 1.0, "right_scale": 1.0, "drift_deg": drift}
+
+    # Magnitude only: which side is the fast one comes from the sign of the
+    # drift, below. Deriving it from the signed difference gets the two
+    # directions backwards.
+    difference = abs((drift / seconds) / deg_per_second_per_unit)
+    stronger = throttle + difference / 2
+    weaker = throttle - difference / 2
+    if weaker <= 0:
+        print("    -> drift too large to trim; check for a mechanical fault")
+        return None
+
+    # Scale the faster side down rather than the slower side up, which has no
+    # headroom left at full throttle anyway.
+    ratio = round(max(0.3, min(1.0, weaker / stronger)), 3)
+    trim = (
+        {"left_scale": ratio, "right_scale": 1.0}
+        if drift > 0  # veered right, so the left side is the faster one
+        else {"left_scale": 1.0, "right_scale": ratio}
+    )
+    trim["drift_deg"] = drift
+    weaker = "right" if drift > 0 else "left"
+    print(f"    -> {weaker} side is slower; scale the other to {ratio}")
+    return trim
+
+
 def measure_forward(driver) -> dict:
     """Metres per second, so blind travel between replies can be reasoned about."""
     print("\n=== Forward speed ===")
@@ -248,6 +351,26 @@ def report(data: dict) -> None:
     if not (scale.get("deg_per_pixel") and pivots):
         print("  Not enough measurements yet to derive turn durations.")
 
+    trim = data.get("trim") or {}
+    stiction = data.get("stiction") or {}
+    if trim or stiction:
+        print("\n  Put these in the environment (run-demo.sh reads them):")
+        for key, name in (
+            ("left_scale", "MOTOR_LEFT_SCALE"), ("right_scale", "MOTOR_RIGHT_SCALE"),
+        ):
+            if trim.get(key) is not None:
+                print(f"    export {name}={trim[key]}")
+        for side, name in (("left", "MOTOR_LEFT_MIN"), ("right", "MOTOR_RIGHT_MIN")):
+            if stiction.get(side) is not None:
+                print(f"    export {name}={stiction[side]}")
+        if stiction.get("left") is not None and stiction.get("right") is not None:
+            gap = abs(stiction["left"] - stiction["right"])
+            if gap >= 0.1:
+                heavier = "right" if stiction["right"] > stiction["left"] else "left"
+                print(f"\n  The {heavier} side needs {gap:.2f} more throttle to break")
+                print("  away. Below that the car swings instead of easing forward, so")
+                print(f"  keep BASE_SPEED above {max(stiction.values()):.2f}.")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -255,8 +378,10 @@ def main() -> int:
     parser.add_argument("--pivots", action="store_true", help="yaw rate and coast only")
     parser.add_argument("--scale", action="store_true", help="degrees per pixel only")
     parser.add_argument("--forward", action="store_true", help="forward speed only")
+    parser.add_argument("--trim", action="store_true", help="straight-line trim only")
+    parser.add_argument("--stiction", action="store_true", help="minimum throttle only")
     args = parser.parse_args()
-    chosen = args.pivots or args.scale or args.forward
+    chosen = args.pivots or args.scale or args.forward or args.trim or args.stiction
 
     from drive import make_driver
 
@@ -296,6 +421,14 @@ def main() -> int:
                 release = getattr(camera, "release", None)
                 if release:
                     release()
+        if not chosen or args.trim:
+            trim = measure_trim(driver, data.get("pivots") or {})
+            if trim:
+                data["trim"] = trim
+        if not chosen or args.stiction:
+            stiction = measure_stiction(driver)
+            if stiction:
+                data["stiction"] = stiction
         if not chosen or args.forward:
             speeds = measure_forward(driver)
             if speeds:
