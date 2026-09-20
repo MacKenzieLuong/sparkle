@@ -39,8 +39,10 @@ class TB6612Driver(Driver):
         from gpiozero import DigitalOutputDevice, Motor
 
         self._stby = DigitalOutputDevice(stby, initial_value=True)
-        self._left = Motor(forward=ain1, backward=ain2, enable=pwma)
-        self._right = Motor(forward=bin2, backward=bin1, enable=pwmb)
+        # Matches the verified GPIO test: A forward is GPIO 27 (AIN2),
+        # and B forward is GPIO 16 (BIN1).
+        self._left = Motor(forward=ain2, backward=ain1, enable=pwma)
+        self._right = Motor(forward=bin1, backward=bin2, enable=pwmb)
 
     def apply(self, left: float, right: float) -> None:
         self._stby.on()

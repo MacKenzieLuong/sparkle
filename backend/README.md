@@ -191,10 +191,9 @@ export TB6612_STBY=21
 
 `picamera2`, `gpiozero`, and `openai` require `pip install -r requirements.txt`
 (picamera2 is arm/Linux-only). The mapping follows the SparkFun handoff:
-**Motor A = left wheel** (AIN1=17, AIN2=27, PWMA=13), **Motor B = right wheel**
-(BIN1=16, BIN2=20, PWMB=12), **STBY=21**. The code never swaps A/B for
-forward/reverse/turn behavior. If a wheel spins backwards, flip that motor's
-direction in software (`drive.py`). The car drives slowly (the loop is paced by API
+**Motor A = left wheel** (AIN1=17, AIN2=27, PWMA=13; forward=A IN2/GPIO 27),
+**Motor B = right wheel** (BIN1=16, BIN2=20, PWMB=12; forward=B IN1/GPIO 16),
+and **STBY=21**. The car drives slowly (the loop is paced by API
 latency + `CONTROL_INTERVAL`), so allow plenty of room. Point the web UI at
 the Pi's LAN address and the video preview shows the car's view.
 
