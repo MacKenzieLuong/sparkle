@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 from typing import Optional
 
@@ -48,12 +49,47 @@ class PiCamera(CameraProvider):
         return self._tag_frame(rgb[:, :, ::-1].copy())
 
 
+SOI = b"\xff\xd8"  # JPEG start-of-image
+EOI = b"\xff\xd9"  # JPEG end-of-image
+
+
+def newest_jpeg(buf: bytearray) -> Optional[bytes]:
+    """Pull the newest complete JPEG out of buf, discarding older ones.
+
+    Frames that queued up while a consumer was busy are worthless to a moving
+    car, so only the last complete one survives. Consumed bytes and any junk
+    ahead of a start marker are dropped; a trailing partial frame is kept.
+    """
+    frame = None
+    while True:
+        start = buf.find(SOI)
+        if start < 0:
+            # A lone trailing 0xff may be the first half of the next marker.
+            del buf[: max(0, len(buf) - 1)]
+            return frame
+        end = buf.find(EOI, start + 2)
+        if end < 0:
+            del buf[:start]
+            return frame
+        frame = bytes(buf[start : end + 2])
+        del buf[: end + 2]
+
+
 class RpiCamCamera(CameraProvider):
-    """Read MJPEG frames from one rpicam-vid process shared by all consumers."""
+    """Read MJPEG frames from one rpicam-vid process shared by all consumers.
+
+    A reader thread drains the pipe continuously and keeps only the newest
+    frame. Reading the pipe on demand instead lets it back up behind whichever
+    consumer is slowest, and the car would then steer off a frame describing
+    where it used to be.
+    """
 
     def __init__(self, width: int = 640, height: int = 480, framerate: int = 30):
         super().__init__()
         self._lock = threading.Lock()
+        self._latest: Optional[bytes] = None
+        self._error: Optional[str] = None
+        self._closed = False
         self._camera = subprocess.Popen(
             [
                 "rpicam-vid", "-t", "0", "--codec", "mjpeg",
@@ -62,36 +98,54 @@ class RpiCamCamera(CameraProvider):
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=0,
+            bufsize=65536,
         )
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
 
-    def read(self) -> np.ndarray:
-        with self._lock:
-            raw = self._read_jpeg()
+    def _drain(self) -> None:
+        buf = bytearray()
+        stream = self._camera.stdout
+        if stream is None:
+            with self._lock:
+                self._error = "rpicam-vid stdout is unavailable"
+            return
+        while not self._closed:
+            chunk = stream.read(65536)
+            if not chunk:
+                with self._lock:
+                    if not self._closed:
+                        self._error = "rpicam-vid ended while streaming"
+                return
+            buf += chunk
+            frame = newest_jpeg(buf)
+            if frame is not None:
+                with self._lock:
+                    self._latest = frame
+
+    def read(self, timeout: float = 5.0) -> np.ndarray:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._closed:
+                # Never hand back the last cached frame: a caller steering off
+                # a frozen image would have no way to tell it had stopped.
+                raise RuntimeError("rpicam-vid camera is released")
+            with self._lock:
+                if self._error:
+                    raise RuntimeError(self._error)
+                raw = self._latest
+            if raw is not None:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"rpicam-vid produced no frame within {timeout}s")
+            time.sleep(0.005)
         frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise RuntimeError("rpicam-vid produced an invalid JPEG frame")
         return self._tag_frame(frame)
 
-    def _read_jpeg(self) -> bytes:
-        if self._camera.stdout is None:
-            raise RuntimeError("rpicam-vid stdout is unavailable")
-        stream = self._camera.stdout
-        while True:
-            if stream.read(2) == b"\xff\xd8":
-                break
-            if self._camera.poll() is not None:
-                raise RuntimeError("rpicam-vid exited while waiting for a frame")
-        frame = bytearray(b"\xff\xd8")
-        while True:
-            byte = stream.read(1)
-            if not byte:
-                raise RuntimeError("rpicam-vid ended while reading a frame")
-            frame += byte
-            if frame[-2:] == b"\xff\xd9":
-                return bytes(frame)
-
     def release(self) -> None:
+        self._closed = True
         if self._camera.poll() is None:
             self._camera.terminate()
 

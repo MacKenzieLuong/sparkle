@@ -14,7 +14,14 @@ from camera import CameraProvider, FakeCamera, make_camera
 from controller import command
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
-from vision import DetectedObject, FakeVision, VisionProvider, is_mock, make_vision
+from vision import (
+    DetectedObject,
+    FakeVision,
+    OmniVision,
+    VisionProvider,
+    is_mock,
+    make_vision,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -288,6 +295,11 @@ def _build_app(env: Optional[dict] = None):
         )
         snap["mock"] = is_mock()
         snap["vision_mode"] = "fake" if is_mock() else "http"
+        if isinstance(vision, OmniVision):
+            snap["spend"] = {
+                "estimated_usd": round(vision.estimated_spend_usd, 4),
+                "cap_usd": vision.cost_cap_usd,
+            }
         return snap
 
     @app.get("/video")

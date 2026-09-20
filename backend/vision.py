@@ -22,6 +22,13 @@ def is_mock() -> bool:
     return os.environ.get("MOCK", "true").strip().lower() in ("1", "true", "yes")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass
 class DetectedObject:
     box_2d: Box2D
@@ -67,17 +74,54 @@ class OmniVision(VisionProvider):
             )
         from openai import OpenAI
 
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=_env_float("VISION_TIMEOUT", 10.0),
+            # A retry would re-send a frame describing where the car used to
+            # be. Failing fast costs one miss and the next cycle sends a new one.
+            max_retries=0,
+        )
         self._model = model
         self._jpeg_quality = jpeg_quality
         self._max_tokens = max_tokens
+        self._max_cost = _env_float("MAX_COST_USD", 1.0)
+        self._input_rate = _env_float("VISION_INPUT_USD_PER_MILLION", 0.55)
+        self._output_rate = _env_float("VISION_OUTPUT_USD_PER_MILLION", 2.20)
+        self._spent = 0.0
+
+    @property
+    def estimated_spend_usd(self) -> float:
+        return self._spent
+
+    @property
+    def cost_cap_usd(self) -> float:
+        return self._max_cost
+
+    def _call_cost(self, frame: np.ndarray) -> float:
+        """Upper-bound cost of one detection. Qwen bills one image token per
+        32x32 pixel block; output is charged at its cap. The provider remains
+        the source of truth — this only exists to stop runaway spend."""
+        height, width = frame.shape[:2]
+        image_tokens = ((width + 31) // 32) * ((height + 31) // 32)
+        return (
+            image_tokens * self._input_rate + self._max_tokens * self._output_rate
+        ) / 1_000_000
 
     def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
+        cost = self._call_cost(frame)
+        if self._max_cost > 0 and self._spent + cost > self._max_cost:
+            raise RuntimeError(
+                f"MAX_COST_USD cap of ${self._max_cost:g} reached "
+                f"(estimated ${self._spent:.4f} spent); restart to reset"
+            )
+
         ok, buf = cv2.imencode(
             ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
         )
         if not ok:
             return None
+        self._spent += cost
 
         data_url = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
 

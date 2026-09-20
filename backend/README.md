@@ -50,7 +50,7 @@ to time out.
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (real inference via yibuapi) |
 | `controller.py` | Pure steering math: bounding box → `DriveCommand(left, right, status)` |
-| `camera.py` | `PiCamera` (picamera2 CSI), `FakeCamera` (synthetic frames) |
+| `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
 | `drive.py` | `TB6612Driver` (dual TB6612FNG, gpiozero), `FakeDriver` (logs) |
 | `scenarios.py` | Scripted bounding-box scenarios shared by `FakeVision` and `FakeCamera` |
 | `static/index.html` | Web UI: camera preview, target input, scenario/box debug controls |
@@ -97,6 +97,29 @@ export HUAWEI_API_KEY=<key from yibuapi>
 export HUAWEI_BASE_URL=https://yibuapi.com/v1   # optional, this is the default
 export HUAWEI_MODEL=qwen3.8-omni-flash          # optional, this is the default
 ```
+
+### Spend guard
+
+Live mode estimates the cost of every call and refuses to make one that would
+push the total past `MAX_COST_USD` (default **$1.00**). The count is **per
+process**, not per navigation, so a restart is what resets it — a cap that
+reset on every press of Go would not cap a test session. `/status` reports the
+running total:
+
+```json
+"spend": {"estimated_usd": 0.0134, "cap_usd": 1.0}
+```
+
+The estimate bills one input token per 32×32 pixel block plus the full output
+token cap, so it runs slightly ahead of reality rather than behind it. It is a
+local guard, not an accounting record — **set a hard spending limit at the
+provider too.** Hitting the cap raises on each attempt, which counts as a miss,
+so navigation stops within `miss_limit` cycles with the reason in
+`status.error`. No call is sent once the cap is reached.
+
+Requests use a `VISION_TIMEOUT` (default 10s) with **retries disabled**: a
+retry would re-send a frame describing where the car used to be, so failing
+fast and sending a fresh frame next cycle is both cheaper and more correct.
 
 Only one live vision path exists: request/response HTTP calls to
 `OmniVision` on the adaptive cadence described below (`CONTROL_INTERVAL` /
@@ -197,10 +220,14 @@ Debug endpoints return `400` when the providers are not fake.
 | `HUAWEI_API_KEY` | — | Sponsor key; required when `MOCK=false` |
 | `HUAWEI_BASE_URL` | `https://yibuapi.com/v1` | OpenAI-compatible gateway base URL |
 | `HUAWEI_MODEL` | `qwen3.8-omni-flash` | Model used for detection |
-| `CAMERA` | `fake` | `fake`, `picamera2`, or `rpicam` (one `rpicam-vid` MJPEG process) |
+| `CAMERA` | `fake` | `fake`, `picamera2`, `webcam`, or `rpicam` (one `rpicam-vid` MJPEG process, drained by a reader thread that keeps only the newest frame) |
 | `CAMERA_FRAMERATE` | `30` | Capture rate when `CAMERA=rpicam` |
 | `DRIVER` | `fake` | `fake` or `tb6612` (`l298n` accepted as an alias) |
 | `VISION_MAX_TOKENS` | `128` | Small response limit for bounding-box JSON |
+| `VISION_TIMEOUT` | `10` | Per-request timeout in seconds; retries are disabled |
+| `MAX_COST_USD` | `1.00` | Estimated spend cap for the process; `0` disables it |
+| `VISION_INPUT_USD_PER_MILLION` | `0.55` | Image-token input rate used by the estimate |
+| `VISION_OUTPUT_USD_PER_MILLION` | `2.20` | Output-token rate used by the estimate |
 | `CAMERA_WIDTH` / `CAMERA_HEIGHT` | `640` / `480` | Frame resolution |
 | `CONTROL_INTERVAL` | `5` | Seconds between inference calls while the target is far; `0` polls as fast as model latency allows |
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
@@ -218,13 +245,17 @@ Debug endpoints return `400` when the providers are not fake.
 .venv/bin/python -m pytest
 ```
 
-Covers the steering math (`test_controller.py`), the lenient JSON box
-parsing used in real mode (`test_vision.py`), and per-frame camera counters
-(`test_camera.py`). `test_server.py` covers the adaptive pause, the
-inference-overlay state, and the perception/control split: that steering
-outpaces a slow model, that the deadman cuts the motors when a call hangs,
-that arrival ends the run, and that nothing drives the motors after a stop.
-No network, no API usage.
+Covers the steering math (`test_controller.py`) and the lenient JSON box
+parsing plus the spend guard (`test_vision.py`). `test_camera.py` covers frame
+counters, the MJPEG framing rules, and — against a stand-in `rpicam-vid` — that
+a slow consumer is served the newest frame rather than a backlog.
+`test_server.py` covers the adaptive pause, the inference-overlay state, and
+the perception/control split: that steering outpaces a slow model, that the
+deadman cuts the motors when a call hangs, that arrival ends the run, and that
+nothing drives the motors after a stop.
+
+No network and no API usage: the spend-guard tests assert the cap refuses the
+call *before* it reaches the client.
 
 ## Running on the Pi
 
