@@ -10,6 +10,7 @@ import cv2
 
 from pydantic import BaseModel
 
+import controller
 from camera import CameraProvider, FakeCamera, make_camera
 from controller import act, command
 from drive import Driver, FakeDriver, make_driver
@@ -309,6 +310,36 @@ class ControlLoop:
             time.sleep(self._control_period)
 
 
+def _banner(camera, vision, driver) -> str:
+    """Say plainly what is real and what is pretend.
+
+    A fake driver looks identical to a working one from the web UI: the car
+    simply never moves, and the logs fill with commands that went nowhere.
+    """
+    fake_driver = isinstance(driver, FakeDriver)
+    lines = [
+        "",
+        "=" * 62,
+        f"  vision   : {'FAKE (scripted boxes)' if is_mock() else 'LIVE ' + os.environ.get('HUAWEI_MODEL', 'qwen3.8-omni-flash')}",
+        f"  camera   : {type(camera).__name__}"
+        + (f"  rotated {os.environ['CAMERA_ROTATION']}deg" if os.environ.get("CAMERA_ROTATION", "0") != "0" else ""),
+        f"  driver   : {type(driver).__name__}"
+        + ("   <-- NOTHING WILL MOVE" if fake_driver else "   <-- REAL MOTORS"),
+        f"  speed    : BASE_SPEED={controller.BASE_SPEED} TURN_GAIN={controller.TURN_GAIN} "
+        f"SEARCH_SPEED={controller.SEARCH_SPEED}",
+        f"  limits   : STALE_AFTER={_env_float('STALE_AFTER', 8.0)}s "
+        f"MAX_RUN_SECONDS={_env_float('MAX_RUN_SECONDS', 120.0)}s",
+    ]
+    if not is_mock():
+        lines.append(
+            f"  spend cap: ${getattr(vision, 'cost_cap_usd', 0.0):g} for this process"
+        )
+    if fake_driver:
+        lines.append("  ** set DRIVER=tb6612 to drive the real motors **")
+    lines += ["=" * 62, ""]
+    return "\n".join(lines)
+
+
 def _build_app(env: Optional[dict] = None):
     env = env or os.environ
     from fastapi import FastAPI, HTTPException
@@ -319,6 +350,7 @@ def _build_app(env: Optional[dict] = None):
     vision = make_vision(scene)
     driver = make_driver()
     loop = ControlLoop(camera, vision, driver)
+    print(_banner(camera, vision, driver), flush=True)
 
     app = FastAPI(title="RC Car Pilot")
 

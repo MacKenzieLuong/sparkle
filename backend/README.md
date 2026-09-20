@@ -50,6 +50,7 @@ request to time out.
 | --- | --- |
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
 | `cli.py` | One-shot detection, camera listing and motor test from the terminal |
+| `run-demo.sh` | The full live configuration in one command |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (asks the model what to do) |
 | `controller.py` | Executes the model's action under local speed limits; `command()` is the pure steering math |
 | `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
@@ -417,7 +418,14 @@ take the target out of frame.
 **5. Motors on blocks.** Same as step 4 with `DRIVER=tb6612`. The wheels now
 follow the model's decisions with the car going nowhere.
 
-**6. On the floor.** Start slow and in open space. `MAX_RUN_SECONDS` is the
+**6. On the floor.** `./run-demo.sh` sets the whole live configuration in one
+go — real camera, real model, real motors — so no single forgotten `export`
+can leave you driving a simulation. Every value in it can be overridden:
+`BASE_SPEED=0.3 ./run-demo.sh`, or `DRIVER=fake ./run-demo.sh` for a dry run.
+
+The server prints a banner at startup saying what is real and what is fake;
+`driver: FakeDriver <-- NOTHING WILL MOVE` is the one to look for. Start slow
+and in open space. `MAX_RUN_SECONDS` is the
 backstop if the car drives out of wifi range; the web UI's stop button is the
 one you should actually be reaching for.
 
