@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 
 
 def _env_float(name: str, default: float) -> float:
@@ -31,16 +32,59 @@ def condition(value: float, scale: float, minimum: float) -> float:
 
 
 class Driver:
+    """Conditioning shared by every motor backend.
+
+    Beyond the per-side scale and minimum, this breaks static friction. A
+    stalled motor needs more torque to start than to keep turning, so a small
+    steady command that is perfectly able to sustain rotation cannot begin it:
+    the motor sits and buzzes. MOTOR_KICK is a brief higher throttle applied
+    only when a wheel starts from rest or reverses, after which the requested
+    value takes over and the wheel keeps moving at it.
+
+    That is also what makes a slow pivot possible at all. Without it the
+    slowest usable throttle is the breakaway one, so "turn more gently" has a
+    floor; with it, the floor is whatever sustains motion once started, which
+    is lower.
+    """
+
     def __init__(self):
         self.left_scale = _env_float("MOTOR_LEFT_SCALE", 1.0)
         self.right_scale = _env_float("MOTOR_RIGHT_SCALE", 1.0)
         self.left_min = _env_float("MOTOR_LEFT_MIN", 0.0)
         self.right_min = _env_float("MOTOR_RIGHT_MIN", 0.0)
+        # 0 disables the kick entirely, so behaviour is unchanged until it is
+        # measured. Loaded breakaway is higher than what calibrate.py reports,
+        # because that test lifts the wheel clear of the floor.
+        self.kick = _env_float("MOTOR_KICK", 0.0)
+        self.kick_seconds = _env_float("MOTOR_KICK_SECONDS", 0.15)
+        self._previous = {"left": 0.0, "right": 0.0}
+        self._kick_started: dict[str, float | None] = {"left": None, "right": None}
+
+    def _now(self) -> float:
+        """Overridable so a test can drive the kick window without sleeping."""
+        return time.monotonic()
+
+    def _kickstart(self, side: str, value: float, now: float) -> float:
+        """Raise `value` to the kick throttle while a wheel is getting going."""
+        previous = self._previous[side]
+        self._previous[side] = value
+        if self.kick <= 0.0 or value == 0.0:
+            self._kick_started[side] = None
+            return value
+        # From rest, or through a reversal: in both cases the wheel is
+        # stationary at the moment the new command arrives.
+        if previous == 0.0 or (previous < 0.0) != (value < 0.0):
+            self._kick_started[side] = now
+        started = self._kick_started[side]
+        if started is not None and now - started < self.kick_seconds:
+            return math.copysign(min(1.0, max(abs(value), self.kick)), value)
+        return value
 
     def apply(self, left: float, right: float) -> None:
+        now = self._now()
         self._drive(
-            condition(left, self.left_scale, self.left_min),
-            condition(right, self.right_scale, self.right_min),
+            self._kickstart("left", condition(left, self.left_scale, self.left_min), now),
+            self._kickstart("right", condition(right, self.right_scale, self.right_min), now),
         )
 
     def _drive(self, left: float, right: float) -> None:
@@ -48,6 +92,10 @@ class Driver:
 
     def stop(self) -> None:
         # Straight to the motors: a stop must never be lifted by a minimum.
+        # The wheels are about to be stationary, so the next command starts
+        # from rest and has to kick again.
+        self._previous = {"left": 0.0, "right": 0.0}
+        self._kick_started = {"left": None, "right": None}
         self._drive(0.0, 0.0)
 
 

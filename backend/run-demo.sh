@@ -92,6 +92,11 @@ setting MOTOR_LEFT_SCALE 0.95
 setting MOTOR_RIGHT_SCALE 1.0
 setting MOTOR_LEFT_MIN 0.20
 setting MOTOR_RIGHT_MIN 0.15
+# Brief higher throttle when a wheel starts from rest or reverses. Below
+# breakaway a motor only buzzes, so without this a small correction cannot
+# start the wheel at all. 0 disables it.
+setting MOTOR_KICK 0.45
+setting MOTOR_KICK_SECONDS 0.15
 
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows

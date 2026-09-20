@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from drive import FakeDriver, condition
@@ -55,3 +57,74 @@ def test_driver_stop_bypasses_the_minimum(monkeypatch):
 
     driver.stop()
     assert driver.last == (0.0, 0.0), "stop must be an actual stop"
+
+
+def _driver_with(**env):
+    """A FakeDriver built with these settings.
+
+    The knobs are read in Driver.__init__, so setting the environment and
+    constructing is enough — no module reload, which would swap the classes
+    other tests already hold.
+    """
+    saved = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        return FakeDriver()
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _at(driver, clock):
+    """Drive the kick window from a fake clock, never the real one."""
+    driver._now = lambda: clock[0]
+    return driver
+
+
+def test_kick_is_off_by_default():
+    driver = _driver_with(MOTOR_KICK="0", MOTOR_LEFT_MIN="0.2")
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) < 0.3, "no kick unless MOTOR_KICK is set"
+
+
+def test_kick_breaks_friction_then_settles():
+    """A stalled motor needs more torque to start than to keep turning."""
+    clock = [100.0]
+    driver = _at(_driver_with(
+        MOTOR_KICK="0.5", MOTOR_KICK_SECONDS="0.15", MOTOR_LEFT_MIN="0.2"), clock)
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) == pytest.approx(0.5), "starts with the kick"
+    clock[0] += 0.05
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) == pytest.approx(0.5), "still kicking inside the window"
+    clock[0] += 0.2
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) < 0.3, "settles to the requested throttle"
+
+
+def test_kick_repeats_after_a_stop_and_on_reversal():
+    clock = [100.0]
+    driver = _at(_driver_with(
+        MOTOR_KICK="0.5", MOTOR_KICK_SECONDS="0.15", MOTOR_LEFT_MIN="0.2"), clock)
+    driver.apply(0.05, 0.05)
+    clock[0] += 1.0
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) < 0.3
+    driver.stop()
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) == pytest.approx(0.5), "a stop means starting from rest"
+    clock[0] += 1.0
+    driver.apply(0.05, 0.05)
+    assert abs(driver.last[0]) < 0.3
+    driver.apply(-0.05, -0.05)
+    assert abs(driver.last[0]) == pytest.approx(0.5), "a reversal is also from rest"
+
+
+def test_kick_never_lifts_a_stop():
+    driver = _driver_with(MOTOR_KICK="0.5", MOTOR_LEFT_MIN="0.2")
+    driver.apply(0.05, 0.05)
+    driver.stop()
+    assert driver.last == (0.0, 0.0)
