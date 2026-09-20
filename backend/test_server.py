@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 
@@ -121,6 +123,44 @@ def test_infer_recorded_with_frame_no():
     finally:
         os.environ.clear()
         os.environ.update(old)
+
+
+def test_app_is_built_once_per_process():
+    """Each build opens a camera, and a real one cannot be acquired twice."""
+    import server
+
+    assert server.get_app() is server.app
+    assert server.get_app() is server.get_app()
+
+
+def test_server_startup_opens_one_camera():
+    """Importing server and asking for the app must not open a second camera.
+
+    A real camera cannot be acquired twice: the second rpicam-vid dies with
+    "Pipeline handler in use by another process".
+    """
+    code = (
+        "import camera\n"
+        "opened = []\n"
+        "_real = camera.make_camera\n"
+        "def counting(scene):\n"
+        "    opened.append(1)\n"
+        "    return _real(scene)\n"
+        "camera.make_camera = counting\n"
+        "import server\n"          # builds app at import
+        "server.get_app()\n"       # what __main__ does
+        "print('cameras=', len(opened))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, "MOCK": "true", "CAMERA": "fake", "DRIVER": "fake"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "cameras= 1" in result.stdout, result.stdout
 
 
 def test_steering_outpaces_slow_inference():

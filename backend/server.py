@@ -426,8 +426,20 @@ def _build_app(env: Optional[dict] = None):
     return app
 
 
+_app = None
+
+
 def get_app():
-    return _build_app()
+    """The one app for this process.
+
+    Building twice opens the camera twice, and the second rpicam-vid cannot
+    acquire a sensor the first already holds — so both `python server.py` and
+    `uvicorn server:app` have to land on the same instance.
+    """
+    global _app
+    if _app is None:
+        _app = _build_app()
+    return _app
 
 
 app = get_app()
@@ -437,4 +449,4 @@ if __name__ == "__main__":
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run(get_app(), host=host, port=port)
+    uvicorn.run(app, host=host, port=port)
