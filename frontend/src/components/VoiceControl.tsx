@@ -35,6 +35,14 @@ export function VoiceControl({ connected, capabilities, onResult }: {
     try {
       const result = await interpretAudio(audio, crypto.randomUUID())
       if (current !== token.current) return
+      console.log('Voice interpretation', {
+        requestId: result.requestId,
+        transcript: result.transcript,
+        intent: result.intent,
+        target: result.target,
+        reason: result.reason,
+        simulated: result.simulated,
+      })
       setTranscript(result.transcript)
       if (result.intent === 'reject') {
         setFeedback('The transcription is unclear, so this command cannot be accepted. Please try again.')
