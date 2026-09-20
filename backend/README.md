@@ -507,8 +507,22 @@ which each wheel starts turning. Below that a loaded motor sits humming while
 the other side drives, so the car swings instead of easing forward. A stop is
 never lifted — it reaches the motors as a stop.
 
-Yaw rate and coast come from one experiment run at two durations, since
-`angle(t) = rate * t + coast` solves for both. Degrees per pixel is measured
+Yaw rate and coast need no compass or protractor. The car pivots while you
+press Enter at the **quarter turn** (square to where it started) and the
+**half turn** (facing exactly backwards) — both easy to judge against a wall or
+a tile edge. Pressing at *two* marks is what makes it accurate: with a reaction
+delay `d`, `90 = rate*(t90 - d)` and `180 = rate*(t180 - d)`, so subtracting
+one from the other cancels `d` entirely and leaves `rate = 90 / (t180 - t90)`.
+
+| your reaction | one mark would say | two marks say |
+| --- | --- | --- |
+| 0.2 s late | 40.9 deg/s | **45.0 deg/s** |
+| 0.5 s late | 36.0 deg/s | **45.0 deg/s** |
+| 0.9 s late | 31.0 deg/s | **45.0 deg/s** |
+
+Coast comes from a third press when the car stops moving, since a body slowing
+to rest sweeps about `rate * time / 2`. A watchdog cuts the motors after 25s in
+case nobody presses anything, because the car is spinning while it waits. Degrees per pixel is measured
 with optical flow rather than a protractor: the car turns by a known angle and
 the image reports how far it moved, which captures the lens *and* whatever crop
 `rpicam-vid` applied. Neither can be taken from a datasheet — a skid-steer car

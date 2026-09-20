@@ -13,10 +13,10 @@ Four things get measured:
   scale       degrees per pixel of horizontal image offset
   speed       metres per second forward at a given throttle
 
-Yaw rate and coast come from the same experiment: turning for two different
-durations gives angle(t) = rate*t + coast, which solves for both. Scale is
-measured with optical flow rather than a protractor — the car is rotated by a
-known angle and the image is asked how far it moved.
+No compass or protractor is needed. The car turns while you press Enter at the
+quarter and half turn; pressing at two marks makes your reaction time cancel
+out of the arithmetic. Degrees per pixel is measured with optical flow: the car
+turns a known amount and the image reports how far it moved.
 
 THE CAR MUST BE ON THE FLOOR with clear space around it. On blocks the wheels
 turn without the body rotating and every number comes out meaningless.
@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -36,7 +37,7 @@ import numpy as np
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "calibration.json"
 PIVOT_DIFFERENTIALS = (0.25, 0.35, 0.5)
-PIVOT_DURATIONS = (1.0, 2.0)
+PIVOT_TIMEOUT = 25.0  # the car is spinning; never wait on a press forever
 FORWARD_THROTTLES = (0.2, 0.35)
 FORWARD_SECONDS = 2.0
 
@@ -77,46 +78,84 @@ def pulse(driver, left: float, right: float, seconds: float) -> None:
     driver.stop()
 
 
+def watchdog(driver, seconds: float) -> threading.Timer:
+    """Cut the motors if nobody presses anything. The car is spinning."""
+    timer = threading.Timer(seconds, driver.stop)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def press(prompt: str) -> Optional[float]:
+    """Wait for Enter and report when it came. None aborts."""
+    try:
+        if input(f"    {prompt}").strip().lower() in ("q", "quit", "abort"):
+            return None
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return time.monotonic()
+
+
 def measure_pivots(driver) -> dict:
-    """Yaw rate and coast, from angle(t) = rate*t + coast at two durations."""
+    """Yaw rate and coast, timed by eye against a quarter and a half turn.
+
+    No compass or protractor: perpendicular and fully-reversed are both easy to
+    judge. Pressing at *two* marks is what makes it accurate — with a reaction
+    delay t, 90 = rate*(t90 - t) and 180 = rate*(t180 - t), so subtracting one
+    from the other cancels the delay and leaves rate = 90 / (t180 - t90).
+
+    Coast then comes from a third press when the car stops moving: a body
+    slowing to rest sweeps about rate * time / 2.
+    """
     print("\n=== Yaw rate and coast ===")
-    print("The car will pivot in place. After each one, measure how far the body")
-    print("rotated in degrees — a phone compass is easiest; chalk marks work too.")
+    print("The car pivots in place, slowly. Press Enter twice while it turns:")
+    print("  once at the QUARTER turn  (square to where it started)")
+    print("  once at the HALF turn     (facing exactly backwards)")
+    print("Then once more when it has completely stopped moving.")
+    print("Line the car up against a wall or a tile edge to judge the marks.")
     results: dict[str, dict] = {}
 
     for differential in PIVOT_DIFFERENTIALS:
-        angles: dict[float, float] = {}
-        for seconds in PIVOT_DURATIONS:
-            if not countdown(
-                f"pivot right at differential {differential} for {seconds}s", 3
-            ):
-                return results
-            pulse(driver, differential, -differential, seconds)
-            time.sleep(1.0)  # let it settle before the measurement is taken
-            angle = ask_float(f"degrees turned ({seconds}s at {differential})")
-            if angle is None:
-                return results
-            if not np.isnan(angle):
-                angles[seconds] = abs(angle)
+        if not countdown(f"pivot at differential {differential}", 3):
+            return results
 
-        if len(angles) == 2:
-            (short_t, short_a), (long_t, long_a) = sorted(angles.items())
-            rate = (long_a - short_a) / (long_t - short_t)
-            coast = short_a - rate * short_t
-            results[str(differential)] = {
-                "deg_per_second": round(rate, 2),
-                "coast_deg": round(max(0.0, coast), 2),
-                "measured": {str(k): v for k, v in angles.items()},
-            }
-            print(f"    -> {rate:.1f} deg/s, coasting {max(0.0, coast):.1f} deg after stop")
-        elif angles:
-            seconds, angle = next(iter(angles.items()))
-            results[str(differential)] = {
-                "deg_per_second": round(angle / seconds, 2),
-                "coast_deg": None,
-                "measured": {str(seconds): angle},
-            }
-            print(f"    -> {angle / seconds:.1f} deg/s (coast needs both durations)")
+        guard = watchdog(driver, PIVOT_TIMEOUT)
+        driver.apply(differential, -differential)
+        started = time.monotonic()
+
+        quarter = press("press Enter at the QUARTER turn... ")
+        half = press("press Enter at the HALF turn... ") if quarter else None
+        driver.stop()
+        guard.cancel()
+        if quarter is None or half is None:
+            return results
+
+        cut = time.monotonic()
+        settled = press("press Enter once it has STOPPED moving... ")
+        if settled is None:
+            return results
+
+        t90, t180 = quarter - started, half - started
+        if t180 - t90 < 0.15:
+            print("    -> the two presses were too close together to use")
+            continue
+
+        rate = 90.0 / (t180 - t90)
+        reaction = t90 - 90.0 / rate
+        coast = rate * (settled - cut) / 2.0
+        results[str(differential)] = {
+            "deg_per_second": round(rate, 2),
+            "coast_deg": round(max(0.0, coast), 2),
+            "reaction_s": round(reaction, 3),
+            "measured": {"t90": round(t90, 3), "t180": round(t180, 3),
+                         "coast_s": round(settled - cut, 3)},
+        }
+        print(f"    -> {rate:.1f} deg/s, coasting {max(0.0, coast):.1f} deg "
+              f"over {settled - cut:.2f}s")
+        if not -0.1 < reaction < 1.0:
+            print(f"       (implied reaction time {reaction:+.2f}s looks off — "
+                  "if the marks were misjudged, redo this one)")
     return results
 
 

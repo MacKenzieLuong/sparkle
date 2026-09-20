@@ -56,29 +56,58 @@ def test_ask_float_rejects_nonsense_then_accepts(monkeypatch):
     assert calibrate.ask_float("x") == 31.0
 
 
-def test_pivots_solve_rate_and_coast(instant, monkeypatch):
-    """1s -> 55 deg and 2s -> 95 deg means 40 deg/s with 15 deg of coast."""
+def fake_clock(monkeypatch, stamps):
+    """Drive time.monotonic through a fixed sequence of instants."""
+    remaining = list(stamps)
+    monkeypatch.setattr(calibrate.time, "monotonic", lambda: remaining.pop(0))
+
+
+def test_pivots_cancel_reaction_time(instant, monkeypatch):
+    """A press 0.3s late at both marks must not distort the rate.
+
+    True rate 45 deg/s, so 90 deg at 2.0s and 180 deg at 4.0s. Pressing 0.3s
+    late at each gives 2.3 and 4.3; the difference is still 2.0s.
+    """
     monkeypatch.setattr(calibrate, "PIVOT_DIFFERENTIALS", (0.3,))
-    scripted(monkeypatch, ["55", "95"])
+    monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
+    #        start, t90,  t180, cut,  settled
+    fake_clock(monkeypatch, [0.0, 2.3, 4.3, 4.35, 4.95])
+    scripted(monkeypatch, ["", "", ""])
     driver = StubDriver()
 
-    result = calibrate.measure_pivots(driver)
+    result = calibrate.measure_pivots(driver)["0.3"]
 
-    assert result["0.3"]["deg_per_second"] == pytest.approx(40.0)
-    assert result["0.3"]["coast_deg"] == pytest.approx(15.0)
+    assert result["deg_per_second"] == pytest.approx(45.0)
+    assert result["reaction_s"] == pytest.approx(0.3, abs=1e-6)
+    # 0.6s of coasting at 45 deg/s, decelerating: about 13.5 deg
+    assert result["coast_deg"] == pytest.approx(13.5, abs=0.1)
     assert (0.3, -0.3) in driver.pulses, "should have pivoted, not driven straight"
-    assert driver.stopped >= 2
 
 
-def test_pivot_with_one_duration_reports_no_coast(instant, monkeypatch):
+def test_pivots_reject_presses_too_close_together(instant, monkeypatch):
     monkeypatch.setattr(calibrate, "PIVOT_DIFFERENTIALS", (0.3,))
-    monkeypatch.setattr(calibrate, "PIVOT_DURATIONS", (2.0,))
-    scripted(monkeypatch, ["80"])
+    monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
+    fake_clock(monkeypatch, [0.0, 2.0, 2.05, 2.1, 2.5])
+    scripted(monkeypatch, ["", "", ""])
 
-    result = calibrate.measure_pivots(StubDriver())
+    assert calibrate.measure_pivots(StubDriver()) == {}
 
-    assert result["0.3"]["deg_per_second"] == pytest.approx(40.0)
-    assert result["0.3"]["coast_deg"] is None, "coast needs two durations"
+
+def test_pivot_stops_the_motors_even_if_aborted(instant, monkeypatch):
+    monkeypatch.setattr(calibrate, "PIVOT_DIFFERENTIALS", (0.3,))
+    monkeypatch.setattr(calibrate, "watchdog", lambda *a: _NullTimer())
+    fake_clock(monkeypatch, [0.0, 1.0])
+    scripted(monkeypatch, ["q"])
+    driver = StubDriver()
+
+    calibrate.measure_pivots(driver)
+
+    assert driver.stopped >= 1, "a spinning car must be stopped on abort"
+
+
+class _NullTimer:
+    def cancel(self):
+        pass
 
 
 def test_abort_stops_the_run(instant, monkeypatch):
