@@ -32,6 +32,17 @@ class CameraProvider:
     def frame_no(self) -> int:
         return self._frame_no
 
+    @property
+    def capture_no(self) -> int:
+        """How many distinct frames the sensor has produced.
+
+        Defaults to the read count, which is right for providers that produce a
+        frame per read. RpiCamCamera serves the newest frame it is holding, so
+        reads closer together than the frame interval return the same picture —
+        it overrides this so callers can tell.
+        """
+        return self._frame_no
+
     def read(self) -> np.ndarray:
         raise NotImplementedError
 
@@ -108,6 +119,7 @@ class RpiCamCamera(CameraProvider):
         super().__init__()
         self._lock = threading.Lock()
         self._latest: Optional[bytes] = None
+        self._captures = 0
         self._error: Optional[str] = None
         self._closed = False
         self._command = [
@@ -180,6 +192,12 @@ class RpiCamCamera(CameraProvider):
             if frame is not None:
                 with self._lock:
                     self._latest = frame
+                    self._captures += 1
+
+    @property
+    def capture_no(self) -> int:
+        with self._lock:
+            return self._captures
 
     def read(self, timeout: float = 5.0) -> np.ndarray:
         deadline = time.monotonic() + timeout

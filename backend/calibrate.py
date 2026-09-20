@@ -243,6 +243,27 @@ def grey_of(camera) -> np.ndarray:
     return cv2.cvtColor(camera.read(), cv2.COLOR_BGR2GRAY)
 
 
+def fresh_grey(camera, after_capture: Optional[int] = None, timeout: float = 1.0):
+    """A frame the sensor has actually produced since `after_capture`.
+
+    rpicam-vid hands back the newest frame it is holding, so two reads a
+    millisecond apart return the same picture. Comparing that pair reports
+    exactly zero motion however fast the car is spinning.
+
+    Polls by reading rather than by watching the counter, because the two
+    camera kinds advance it differently: a background reader bumps it on its
+    own schedule, while the others only produce a frame when asked.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        frame = grey_of(camera)
+        capture = camera.capture_no
+        now = time.monotonic()
+        if after_capture is None or capture != after_capture or now >= deadline:
+            return frame, capture, now
+        time.sleep(0.002)
+
+
 def flow_sample(camera, pairs: int = 5) -> Optional[tuple]:
     """How fast the image is sliding sideways, and how rigidly.
 
@@ -253,13 +274,14 @@ def flow_sample(camera, pairs: int = 5) -> Optional[tuple]:
     """
     rates, spreads = [], []
     for _ in range(pairs):
-        before = grey_of(camera)
-        started = time.monotonic()
+        before, capture, started = fresh_grey(camera)
         points = cv2.goodFeaturesToTrack(before, 150, 0.01, 7)
         if points is None or len(points) < 15:
             continue
-        after = grey_of(camera)
-        elapsed = time.monotonic() - started
+        after, next_capture, finished = fresh_grey(camera, capture)
+        if next_capture == capture:
+            continue  # no new frame arrived; comparing these would read zero
+        elapsed = finished - started
         if elapsed <= 0:
             continue
         moved, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -302,7 +324,14 @@ def auto_pivot(driver, camera, stiction: dict) -> Optional[dict]:
         print("  not enough features to see motion — aim somewhere more textured")
         return None
     noise = abs(still[0])
-    print(f"  stationary noise floor: {noise:.0f} px/s")
+    print(f"  stationary noise floor: {noise:.2f} px/s")
+    if noise == 0.0:
+        # A camera pointed at a real scene always registers something. Exactly
+        # zero means the same frame is being compared with itself.
+        print("\n  Exactly zero is not a real measurement — the camera is")
+        print("  returning the same frame twice. Every reading below would be")
+        print("  zero no matter how fast the car span, so stopping here.")
+        return None
 
     steps = []
     effective: Optional[float] = None
