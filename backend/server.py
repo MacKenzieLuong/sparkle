@@ -66,7 +66,7 @@ class ControlLoop:
         self._short_interval = _env_float("SHORT_INTERVAL", 1.0)
         self._short_interval_area = _env_float("SHORT_INTERVAL_AREA", 0.15)
         self._control_period = 1.0 / max(_env_float("CONTROL_HZ", 10.0), 0.1)
-        self._stale_factor = _env_float("STALE_FACTOR", 2.5)
+        self._stale_factor = _env_float("STALE_FACTOR", 1.5)
         self._stale_min = _env_float("STALE_MIN", 1.0)
         self._miss_limit = 3
         self._lock = threading.Lock()

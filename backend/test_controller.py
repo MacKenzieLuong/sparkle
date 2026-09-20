@@ -1,6 +1,32 @@
+import os
+import subprocess
+import sys
+
 import pytest
 
 from controller import command
+
+
+def _throttle_with(**env) -> float:
+    """Left throttle for a centred box, from a fresh interpreter.
+
+    The knobs are read at import, so a subprocess is the honest way to prove
+    the environment actually reaches the steering math.
+    """
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import controller;"
+            "print(f'{controller.command((350, 400, 650, 600)).left:.6f}')",
+        ],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return float(result.stdout.strip())
 
 
 def test_center_target_drives_straight():
@@ -65,6 +91,32 @@ def test_bigger_target_slows_down():
     assert near.status == "moving"
     assert near.left < far.left
     assert near.right < far.right
+
+
+def test_base_speed_is_configurable():
+    # A centred box: no turn, so throttle is BASE_SPEED scaled by 0.88 for area.
+    assert _throttle_with(BASE_SPEED="0.5") == pytest.approx(0.44, abs=1e-4)
+    assert _throttle_with(BASE_SPEED="0.2") == pytest.approx(0.176, abs=1e-4)
+
+
+def test_turn_gain_is_configurable():
+    hard = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import controller;"
+            "c = controller.command((300, 750, 700, 950));"
+            "print(f'{c.left - c.right:.6f}')",
+        ],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        env={**os.environ, "TURN_GAIN": "0.2"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert hard.returncode == 0, hard.stderr
+    gentle = float(hard.stdout.strip())
+    reference = command((300, 750, 700, 950))
+    assert 0 < gentle < (reference.left - reference.right)
 
 
 def test_area_fraction_reported():

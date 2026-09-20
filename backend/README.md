@@ -221,12 +221,31 @@ accordingly.
 `controller.command(box_2d)` returns `DriveCommand(left, right, status, note)`:
 
 - `left` / `right` are motor throttles in `[-1, 1]`.
-- `dx = (box_center_x − 500) / 500`; a dead zone (`|dx| < 0.08`) drives
-  straight, otherwise the car turns proportionally (target right → left wheel
-  faster).
-- Approach speed scales down as the box grows; `area_fraction ≥ 0.5` →
-  `status="arrived"` with both throttles `0`.
+- `dx = (box_center_x − 500) / 500`; a dead zone (`DEAD_ZONE`, default 0.08)
+  drives straight, otherwise the car turns proportionally by `TURN_GAIN`
+  (target right → left wheel faster).
+- Approach speed starts at `BASE_SPEED` and scales down as the box grows;
+  `area_fraction ≥ ARRIVED_AREA_FRACTION` → `status="arrived"`, throttles `0`.
 - `box_2d=None` → `status="target_lost"`, both throttles `0`.
+
+### Picking a speed
+
+**Speed has to be chosen against model latency, not by feel.** The car drives
+on the last box for the whole round trip, so at a measured ~3s latency it
+covers three seconds of ground blind between corrections — and the staleness
+deadman cannot react faster than one perception cycle either. Measure first:
+
+```sh
+.venv/bin/python cli.py "<something in frame>" -n 5 --interval 1
+```
+
+Then set `BASE_SPEED` so that *latency × speed* is a distance you are willing
+to let the car travel uncorrected. Start around `0.2` on a first floor test and
+raise it only once you have watched it steer. Lower `TURN_GAIN` with it —
+turning is not scaled by `BASE_SPEED`, so a slow car with the default gain
+spins in place instead of driving toward the target.
+
+These are read at import, so set them before launching the server.
 
 ## API endpoints
 
@@ -265,8 +284,12 @@ Debug endpoints return `400` when the providers are not fake.
 | `SHORT_INTERVAL` | `1` | Seconds between inference calls once the target is near (≥ `SHORT_INTERVAL_AREA`) |
 | `SHORT_INTERVAL_AREA` | `0.15` | Box area fraction (of the 1000×1000 frame) that triggers the fast cadence |
 | `CONTROL_HZ` | `10` | Steering updates per second, independent of inference cadence |
-| `STALE_FACTOR` | `2.5` | Motors cut once the freshest box is this many measured perception cycles old |
+| `STALE_FACTOR` | `1.5` | Motors cut once the freshest box is this many measured perception cycles old |
 | `STALE_MIN` | `1.0` | Floor for the staleness window, in seconds |
+| `BASE_SPEED` | `0.5` | Forward throttle before area scaling — **lower this for a slow first test** |
+| `TURN_GAIN` | `0.8` | Turn aggressiveness; lower it alongside `BASE_SPEED` |
+| `DEAD_ZONE` | `0.08` | Horizontal offset below which the car drives straight |
+| `ARRIVED_AREA_FRACTION` | `0.5` | Box area fraction that counts as arrived |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
 | `TB6612_AIN1`…`TB6612_STBY` | see `.env.example` | GPIO pins for the dual TB6612FNG (SparkFun) |
 | `TB6612_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 FRAME_CENTER = 500
-DEAD_ZONE = 0.08
-ARRIVED_AREA_FRACTION = 0.5
-BASE_SPEED = 0.5
-TURN_GAIN = 0.8
 MIN_SPEED_SCALE = 0.15
+
+# Read once at import: the server sets these before it starts. How fast the car
+# may travel while blind between model calls is a property of the drivetrain,
+# so it has to be tunable per car rather than baked in here.
+DEAD_ZONE = _env_float("DEAD_ZONE", 0.08)
+ARRIVED_AREA_FRACTION = _env_float("ARRIVED_AREA_FRACTION", 0.5)
+BASE_SPEED = _env_float("BASE_SPEED", 0.5)
+TURN_GAIN = _env_float("TURN_GAIN", 0.8)
 
 
 @dataclass
