@@ -111,6 +111,25 @@ export class RobotConnection {
     this.update({ queue: this.view.queue.slice(1) })
     await this.send(task, resume)
   }
+  private async runStop() {
+    this.generation++
+    this.update({ paused: true, message: 'Pausing navigation…' })
+    try {
+      await this.api.stop(); this.unknown = false
+      this.update({ message: 'Navigation paused. Queue retained.' }); this.log(this.view.message)
+    } catch {
+      this.update({ message: 'Stop outcome unknown. Queue stays paused; refreshing status.' }); this.log(this.view.message)
+    }
+    await this.refresh()
+  }
+
+  // Deliberately not behind accept()'s connected check. That check reads a
+  // poll up to a second old, and a stop control that refuses to even attempt
+  // the request because of a stale belief about the network is the one
+  // failure this button cannot have. A genuinely unreachable robot still
+  // reports "outcome unknown" and leaves the queue paused.
+  stopNow = () => this.runStop()
+
   async accept(result: VoiceResult) {
     if (!this.view.connected) throw new Error('Connection lost. Command was not queued.')
     if (this.seenVoice.has(result.requestId)) return
@@ -123,15 +142,7 @@ export class RobotConnection {
       // Poll serially so each dispatch uses a freshly observed revision.
       await this.refresh()
     } else if (result.intent === 'stop') {
-      this.generation++
-      this.update({ paused: true, message: 'Pausing navigation…' })
-      try {
-        await this.api.stop(); this.unknown = false
-        this.update({ message: 'Navigation paused. Queue retained.' }); this.log(this.view.message)
-      } catch {
-        this.update({ message: 'Stop outcome unknown. Queue stays paused; refreshing status.' }); this.log(this.view.message)
-      }
-      await this.refresh()
+      await this.runStop()
     } else if (result.intent === 'resume') {
       await this.refresh()
       if (!this.view.connected || !this.snapshot) throw new Error('Waiting for robot connection.')

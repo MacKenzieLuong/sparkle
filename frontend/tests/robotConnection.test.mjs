@@ -104,3 +104,66 @@ test('a typed target dispatches through the same path as a spoken one', async t 
   await connection.refresh()
   assert.equal(api.commands[1].target, 'the blue flag')
 })
+
+test('a backend restart latches the queue paused; a typed resume clears it', async t => {
+  const { api, connection } = await setup(t)
+  // The restart the operator causes every time they Ctrl+C the backend.
+  api.current = { ...api.current, instance_id: 'restarted-server' }
+  await connection.refresh()
+  assert.equal(connection.getSnapshot().paused, true, 'a restart pauses the queue')
+
+  // Targets queue but must not dispatch while paused: this is the state where
+  // the backend log shows polling and heartbeats but never a /direct.
+  await connection.accept(typedCommand('the red ball'))
+  assert.equal(api.commands.length, 0, 'paused queue dispatches nothing')
+  assert.equal(connection.getSnapshot().queue.length, 1)
+
+  // Typing the resume word has to be able to break the latch, because live
+  // mode has no other resume control and the microphone needs a secure origin.
+  await connection.accept(typedCommand('resume', await api.capabilities()))
+  assert.equal(connection.getSnapshot().paused, false, 'resume unpauses')
+  assert.equal(api.commands.length, 1, 'the held target now dispatches')
+  assert.equal(api.commands[0].target, 'the red ball')
+})
+
+test('typed stop and resume map to intents, anything else is a target', async () => {
+  const capabilities = { stopWord: 'stop', resumeWord: 'resume' }
+  assert.equal(typedCommand('stop', capabilities).intent, 'stop')
+  assert.equal(typedCommand('  RESUME ', capabilities).intent, 'resume')
+  assert.equal(typedCommand('the red ball', capabilities).intent, 'navigate')
+  assert.equal(typedCommand('stop sign', capabilities).target, 'stop sign')
+  assert.equal(typedCommand('stop', capabilities).target, null, 'a stop carries no target')
+})
+
+test('stopNow reaches the robot even when the view believes it is disconnected', async t => {
+  const { api, connection } = await setup(t)
+  await connection.accept(typedCommand('the red ball'))
+  assert.equal(api.commands.length, 1)
+
+  // A failed poll marks the view disconnected. That belief is up to a second
+  // old, and accept() refuses outright on it -- which is exactly when someone
+  // reaches for stop, so the button must not go through that check.
+  const workingStatus = api.status
+  api.status = async () => { throw new Error('network down') }
+  await connection.refresh()
+  assert.equal(connection.getSnapshot().connected, false)
+  await assert.rejects(() => connection.accept(typedCommand('anything')),
+    /Connection lost/, 'accept still refuses, as before')
+
+  let stopped = false
+  api.stop = async () => { stopped = true }
+  api.status = workingStatus
+  await connection.stopNow()
+  assert.equal(stopped, true, 'the stop was actually attempted')
+  assert.equal(connection.getSnapshot().paused, true, 'and the queue is paused')
+})
+
+test('stopNow leaves the queue paused when the robot is unreachable', async t => {
+  const { api, connection } = await setup(t)
+  await connection.accept(typedCommand('the red ball'))
+  api.stop = async () => { throw new Error('unreachable') }
+  await connection.stopNow()
+  const view = connection.getSnapshot()
+  assert.equal(view.paused, true, 'a failed stop must not leave the queue running')
+  assert.match(view.message, /unknown/i)
+})
