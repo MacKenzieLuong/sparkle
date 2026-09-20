@@ -48,6 +48,7 @@ to time out.
 | File | Purpose |
 | --- | --- |
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
+| `cli.py` | One-shot detection from the terminal — model check without the car |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (real inference via yibuapi) |
 | `controller.py` | Pure steering math: bounding box → `DriveCommand(left, right, status)` |
 | `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
@@ -120,6 +121,37 @@ so navigation stops within `miss_limit` cycles with the reason in
 Requests use a `VISION_TIMEOUT` (default 10s) with **retries disabled**: a
 retry would re-send a frame describing where the car used to be, so failing
 fast and sending a fresh frame next cycle is both cheaper and more correct.
+
+## Talking to the model from the terminal
+
+`cli.py` runs one detection and prints what came back — no server, no motors.
+It reads the same env vars as the server, so it is the cheapest way to confirm
+a key, a model, or a camera actually works before the car moves.
+
+```sh
+.venv/bin/python cli.py "the red ball"                 # one look through the camera
+.venv/bin/python cli.py "the red ball" --image shot.jpg # ...or at a saved frame
+.venv/bin/python cli.py "the red ball" -n 5 --interval 1  # sample latency
+.venv/bin/python cli.py "the red ball" --raw --save look   # raw reply + overlays
+```
+
+Each look prints the round trip, the parsed box, and **what the steering math
+would have done with it**:
+
+```
+target 'the red ball' via camera (RpiCamCamera), mock=False
+     1430 ms  'red ball' box=[350, 400, 650, 600] area=0.060 -> left=+0.44 right=+0.44 (moving)
+```
+
+So a bad run can be pinned on the model, the parse, or the controller without
+moving a wheel. `--raw` prints the model's reply verbatim, which is what you
+want the first time a new model returns something `_parse_boxes` rejects.
+`--save NAME` writes `NAME-1.jpg` with the box drawn on the frame, so you can
+check the box is actually *on* the object. Exit status is `0` when something
+was found, `1` when nothing was, `2` on error — usable in a shell loop.
+
+Latency from `-n` is what you tune `CONTROL_INTERVAL` against, and the run ends
+by reporting estimated spend against the cap.
 
 Only one live vision path exists: request/response HTTP calls to
 `OmniVision` on the adaptive cadence described below (`CONTROL_INTERVAL` /

@@ -89,6 +89,7 @@ class OmniVision(VisionProvider):
         self._input_rate = _env_float("VISION_INPUT_USD_PER_MILLION", 0.55)
         self._output_rate = _env_float("VISION_OUTPUT_USD_PER_MILLION", 2.20)
         self._spent = 0.0
+        self.last_raw: Optional[str] = None
 
     @property
     def estimated_spend_usd(self) -> float:
@@ -154,6 +155,7 @@ class OmniVision(VisionProvider):
             if chunk.choices and chunk.choices[0].delta.content:
                 text += chunk.choices[0].delta.content
 
+        self.last_raw = text
         boxes = _parse_boxes(text)
         if not boxes:
             return None
