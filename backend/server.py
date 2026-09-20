@@ -168,6 +168,15 @@ class ControlLoop:
         # thread, and fed from whichever box that thread actually steers on.
         self._damper = TurnDamper()
         self._damper_stream: Optional[Tuple[bool, Optional[float]]] = None
+        # Pulse mode: move only in response to an inference, one short burst
+        # per decision, then stop until the next one arrives. Trades speed
+        # for never travelling on a guess -- see the comment in _control.
+        self._pulse_mode = os.environ.get("PULSE_MODE", "false").lower() in (
+            "1", "true", "yes",
+        )
+        self._pulse_seconds = _env_float("PULSE_SECONDS", 0.25)
+        self._pulse_until: Optional[float] = None
+        self._pulse_for: Optional[float] = None
         self.state = {
             "running": False,
             "target": None,
@@ -229,6 +238,8 @@ class ControlLoop:
             self._damper.reset()
             self._damper_stream = None
             self._slot_at = None
+            self._pulse_until = None
+            self._pulse_for = None
             self.state.update(
                 running=True,
                 target=target,
@@ -257,7 +268,7 @@ class ControlLoop:
                 target=self._perceive, args=(epoch, index), daemon=True
             ).start()
         threading.Thread(target=self._control, args=(epoch,), daemon=True).start()
-        if self._track_enabled:
+        if self._track_enabled and not self._pulse_mode:
             threading.Thread(target=self._track, args=(epoch,), daemon=True).start()
         return False
 
@@ -314,6 +325,14 @@ class ControlLoop:
                 round(self._cycle_time, 3) if self._cycle_time is not None else None
             )
             return snap
+
+    @property
+    def pulse_mode(self) -> bool:
+        return self._pulse_mode
+
+    @property
+    def pulse_seconds(self) -> float:
+        return self._pulse_seconds
 
     def budget_banner(self) -> str:
         if self._deg_per_turn_second:
@@ -578,7 +597,8 @@ class ControlLoop:
                     None if self._tracked_seed is None else now - self._tracked_seed
                 )
                 trackable = (
-                    self._tracked is not None
+                    not self._pulse_mode
+                    and self._tracked is not None
                     and self._tracked_at is not None
                     and seed_age is not None
                     and seed_age <= self._track_max_age
@@ -587,6 +607,20 @@ class ControlLoop:
                     detection, source_at = self._tracked, self._tracked_at
                 else:
                     detection, source_at = self._latest, self._latest_at
+                # Pulse mode: one short burst per model decision, then stop and
+                # wait for the next. The car never moves on an extrapolation --
+                # not on a tracked box, not on a decision held past its arrival
+                # -- so every millimetre it travels is one the model asked for
+                # while looking at a frame. Slower by construction, and the
+                # overshoot that the lead term and the rotation budget exist to
+                # correct simply cannot accumulate.
+                if self._pulse_mode and source_at is not None and source_at != self._pulse_for:
+                    self._pulse_for = source_at
+                    self._pulse_until = now + self._pulse_seconds
+                pulsing = (
+                    not self._pulse_mode
+                    or (self._pulse_until is not None and now < self._pulse_until)
+                )
                 # The damper differences successive boxes, so it has to know
                 # when the box stops being the same running measurement:
                 # falling back to the model's box, or re-seeding onto a newly
@@ -616,7 +650,7 @@ class ControlLoop:
                 dx_of(detection.box_2d) if detection is not None else None, now
             )
 
-            if detection is not None and fresh:
+            if detection is not None and fresh and pulsing:
                 authority = turn_authority(age or 0.0)
                 cmd = act(detection.action, detection.box_2d, authority, turn_rate)
                 with self._lock:
@@ -663,7 +697,11 @@ class ControlLoop:
                     if not self._owns(epoch):
                         return
                     self._driver.stop()
-                    self.state["status"] = "acquiring" if age is None else "stale"
+                    self.state["status"] = (
+                        "acquiring" if age is None
+                        else "waiting" if self._pulse_mode and fresh
+                        else "stale"
+                    )
                     self.state["last_command"] = None
 
             time.sleep(self._control_period)
@@ -686,6 +724,10 @@ def _banner(camera, vision, driver, loop) -> str:
         + ("   <-- NOTHING WILL MOVE" if fake_driver else "   <-- REAL MOTORS"),
         f"  speed    : BASE_SPEED={controller.BASE_SPEED} TURN_GAIN={controller.TURN_GAIN} "
         f"SEARCH_SPEED={controller.SEARCH_SPEED}",
+        (f"  control  : PULSE every inference, {loop.pulse_seconds:g}s per decision"
+         "  (tracking off, nothing moves between replies)"
+         if loop.pulse_mode else
+         "  control  : CONTINUOUS, driving between replies on the tracked box"),
         f"  steering : TURN_LEAD={controller.TURN_LEAD:g}s"
         + (
             "  -- no lead: a coasting chassis will overshoot"

@@ -106,6 +106,13 @@ setting MOTOR_RIGHT_MIN 0.15
 setting MOTOR_KICK 0.45
 setting MOTOR_KICK_SECONDS 0.15
 
+# --- pulse mode ---------------------------------------------------------------
+# One short burst per model decision, then stop until the next. The car never
+# travels on an extrapolation, so overshoot cannot build up between replies.
+# Much slower overall, and tracking is ignored while it is on.
+setting PULSE_MODE true
+setting PULSE_SECONDS 0.25
+
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows
 setting CONTROL_HZ 10

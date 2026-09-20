@@ -830,3 +830,57 @@ def test_restart_switches_target():
 
     assert snap["target"] == "second"
     assert snap["running"] is True
+
+def _duty(driver, seconds, step=0.02):
+    """Sample whether the wheels are turning, and count the separate bursts.
+
+    Sampling starts at the first movement, not at loop start: the seconds
+    before the first reply lands are stopped in both modes, and counting them
+    would say nothing about the difference between the two.
+    """
+    _wait_until(lambda: driver.last != (0.0, 0.0), "the car never moved at all")
+    samples = []
+    started = time.monotonic()
+    while time.monotonic() - started < seconds:
+        samples.append(driver.last != (0.0, 0.0))
+        time.sleep(step)
+    bursts = sum(1 for before, after in zip(samples, samples[1:]) if not before and after)
+    return samples, bursts
+
+
+def test_pulse_mode_moves_once_per_inference_and_stops_between():
+    """Nothing moves on an extrapolation: one burst per decision, then stop."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="30", VISION_CONCURRENCY="1", TRACK="true",
+        PULSE_MODE="true", PULSE_SECONDS="0.2",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, delay=0.5), driver
+        )
+        loop.start("ball")
+        samples, bursts = _duty(driver, 2.2)
+        loop.stop()
+
+    assert bursts >= 2, f"each inference should start its own burst, saw {bursts}"
+    moving = sum(samples) / len(samples)
+    assert moving < 0.6, f"must be stopped between decisions, moving {moving:.0%}"
+
+
+def test_continuous_mode_still_drives_between_inferences():
+    """The contrast, so the pulse test cannot pass by the car simply not moving."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="50",
+        STALE_AFTER="30", VISION_CONCURRENCY="1", TRACK="true", PULSE_MODE="false",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, delay=0.5), driver
+        )
+        loop.start("ball")
+        samples, _ = _duty(driver, 2.2)
+        loop.stop()
+
+    moving = sum(samples) / len(samples)
+    assert moving > 0.8, f"continuous mode drives between replies, moving {moving:.0%}"
