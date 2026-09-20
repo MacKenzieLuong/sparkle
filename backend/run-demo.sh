@@ -66,7 +66,7 @@ setting VISION_SPACING 1.5
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
 setting BASE_SPEED 0.2
-setting TURN_GAIN 0.3
+setting TURN_GAIN 0.35
 # Seconds of lead in the steering error, cancelling the rotation the car keeps
 # after the power is cut. 0 is the plain proportional turn, which overshoots on
 # a chassis with any momentum; set it from the coast calibrate.py measures.
@@ -74,15 +74,24 @@ setting TURN_LEAD 0
 # A pivoting car keeps rotating after the command stops, so call it centred
 # sooner than a wheeled robot would. Raise further if it still overshoots.
 setting DEAD_ZONE 0.15
-setting SEARCH_SPEED 0.25
+# The in-place scan pivot. Floored by the stiction minimums below: as this
+# approaches 0 the wheels still get MOTOR_*_MIN, because under that they do
+# not turn at all. 0.05 is about as slow as this chassis pivots.
+setting SEARCH_SPEED 0.05
+# Rotation one decision may command before the car coasts straight. Raised
+# alongside TURN_GAIN, or the larger turn is simply clipped and the gain
+# changes nothing. DEG applies once calibration.json has usable pivots;
+# throttle-seconds is the fallback until then.
+setting ROTATION_BUDGET_DEG 30
+setting ROTATION_BUDGET 0.7
 
 # --- chassis trim (from calibrate.py) ---------------------------------------
 # The two sides are not loaded equally, so equal throttle does not drive
 # straight, and the heavier side needs more PWM before it moves at all.
-setting MOTOR_LEFT_SCALE 1.0
+setting MOTOR_LEFT_SCALE 0.95
 setting MOTOR_RIGHT_SCALE 1.0
-setting MOTOR_LEFT_MIN 0.0
-setting MOTOR_RIGHT_MIN 0.0
+setting MOTOR_LEFT_MIN 0.20
+setting MOTOR_RIGHT_MIN 0.15
 
 # --- pacing and limits ------------------------------------------------------
 setting CONTROL_INTERVAL 0      # poll as fast as latency allows
