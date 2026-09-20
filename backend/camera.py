@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -90,18 +91,46 @@ class RpiCamCamera(CameraProvider):
         self._latest: Optional[bytes] = None
         self._error: Optional[str] = None
         self._closed = False
-        self._camera = subprocess.Popen(
-            [
-                "rpicam-vid", "-t", "0", "--codec", "mjpeg",
-                "--width", str(width), "--height", str(height),
-                "--framerate", str(framerate), "--nopreview", "-o", "-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=65536,
-        )
+        self._command = [
+            "rpicam-vid", "-t", "0", "--codec", "mjpeg",
+            "--width", str(width), "--height", str(height),
+            "--framerate", str(framerate), "--nopreview", "-o", "-",
+        ]
+        # stderr goes to a file, not a pipe: nothing drains a pipe here, and a
+        # full one would wedge the camera. Without it a failure is unreadable.
+        self._log = tempfile.TemporaryFile()
+        try:
+            self._camera = subprocess.Popen(
+                self._command,
+                stdout=subprocess.PIPE,
+                stderr=self._log,
+                bufsize=65536,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "rpicam-vid not found — install rpicam-apps, or set CAMERA to "
+                "picamera2, webcam or fake"
+            ) from exc
         self._reader = threading.Thread(target=self._drain, daemon=True)
         self._reader.start()
+
+    def _exit_reason(self) -> str:
+        """Why the camera stopped, including what it printed on the way out."""
+        code = self._camera.poll()
+        head = (
+            f"rpicam-vid exited with code {code}"
+            if code is not None
+            else "rpicam-vid stopped producing frames"
+        )
+        try:
+            self._log.seek(0)
+            output = self._log.read().decode("utf-8", "replace").strip()
+        except (ValueError, OSError):
+            output = ""
+        if not output:
+            return f"{head} (no stderr). Reproduce with: {' '.join(self._command)}"
+        tail = " | ".join(line.strip() for line in output.splitlines()[-4:])
+        return f"{head}: {tail}"
 
     def _drain(self) -> None:
         buf = bytearray()
@@ -113,9 +142,10 @@ class RpiCamCamera(CameraProvider):
         while not self._closed:
             chunk = stream.read(65536)
             if not chunk:
+                reason = self._exit_reason()
                 with self._lock:
                     if not self._closed:
-                        self._error = "rpicam-vid ended while streaming"
+                        self._error = reason
                 return
             buf += chunk
             frame = newest_jpeg(buf)
@@ -148,6 +178,7 @@ class RpiCamCamera(CameraProvider):
         self._closed = True
         if self._camera.poll() is None:
             self._camera.terminate()
+        self._log.close()
 
 
 class WebcamCamera(CameraProvider):

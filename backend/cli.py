@@ -75,7 +75,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         camera = None
     else:
-        camera = make_camera(SCENARIOS["center"])
+        try:
+            camera = make_camera(SCENARIOS["center"])
+        except Exception as exc:
+            print(f"camera unavailable: {exc}", file=sys.stderr)
+            return 2
 
     try:
         vision = make_vision(SCENARIOS["center"])
@@ -92,7 +96,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         for attempt in range(1, args.repeat + 1):
             if camera is not None:
-                frame = camera.read()
+                try:
+                    frame = camera.read()
+                except Exception as exc:
+                    print(f"  camera read failed: {exc}", file=sys.stderr)
+                    return 2
             started = time.monotonic()
             try:
                 detection = vision.detect(args.target, frame)
