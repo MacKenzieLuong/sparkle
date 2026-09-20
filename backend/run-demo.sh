@@ -34,6 +34,14 @@ setting CAMERA rpicam
 setting CAMERA_ROTATION 180
 setting DRIVER tb6612
 
+# --- latency ----------------------------------------------------------------
+# Image tokens go as the area: 640x480 is 300 of them, 320x240 is 80. The
+# reason field is output tokens, and output is generated serially, so it costs
+# wall clock on every single call. Set VISION_EXPLAIN=true while tuning.
+setting VISION_WIDTH 320
+setting VISION_HEIGHT 240
+setting VISION_EXPLAIN false
+
 # --- how fast ---------------------------------------------------------------
 # 3.4s round trip means the car acts on where things were 3.4s ago. Slow.
 setting BASE_SPEED 0.2

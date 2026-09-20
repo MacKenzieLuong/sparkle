@@ -104,6 +104,15 @@ class OmniVision(VisionProvider):
         self._spent = 0.0
         self._history: List[str] = []
         self.last_raw: Optional[str] = None
+        # Downscale before sending: image tokens go as the area, so halving
+        # each side quarters them. 0 keeps the camera's own resolution.
+        self._send_width = int(os.environ.get("VISION_WIDTH", "0"))
+        self._send_height = int(os.environ.get("VISION_HEIGHT", "0"))
+        # A reason is worth reading while tuning, but it is output tokens, and
+        # output is generated one token at a time — it costs wall clock.
+        self._explain = os.environ.get("VISION_EXPLAIN", "false").lower() in (
+            "1", "true", "yes",
+        )
 
     def start(self, target: str) -> None:
         self._history.clear()
@@ -126,7 +135,13 @@ class OmniVision(VisionProvider):
             image_tokens * self._input_rate + self._max_tokens * self._output_rate
         ) / 1_000_000
 
+    def _downscale(self, frame: np.ndarray) -> np.ndarray:
+        if self._send_width > 0 and self._send_height > 0:
+            return cv2.resize(frame, (self._send_width, self._send_height))
+        return frame
+
     def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
+        frame = self._downscale(frame)
         cost = self._call_cost(frame)
         if self._max_cost > 0 and self._spent + cost > self._max_cost:
             raise RuntimeError(
@@ -176,23 +191,22 @@ class OmniVision(VisionProvider):
 
     def _prompt(self, target: str) -> str:
         recent = ", ".join(self._history) if self._history else "none"
-        return (
-            f"You are driving a small robot car toward: '{target}'.\n"
-            f"Your recent actions, oldest first: {recent}\n"
-            "Look at the camera image and choose the next move.\n\n"
-            'Reply with only this JSON object:\n'
-            '{"action": "...", "box_2d": [ymin, xmin, ymax, xmax] or null, '
-            '"label": "...", "reason": "..."}\n\n'
-            "action must be exactly one of:\n"
-            "  approach     - the goal is visible; box_2d must give its box\n"
-            "  search_left  - goal not visible; turn left to look for it\n"
-            "  search_right - goal not visible; turn right to look for it\n"
-            "  back_off     - path blocked or far too close; reverse\n"
-            "  stop         - the car has reached the goal, or cannot continue\n\n"
-            "Use your recent actions so a search keeps turning the same way "
-            "instead of rocking back and forth. Coordinates are normalized to "
-            "0-1000 as [ymin, xmin, ymax, xmax]. Keep reason under 8 words."
+        shape = (
+            '{"action":"...","box_2d":[ymin,xmin,ymax,xmax] or null,"reason":"..."}'
+            if self._explain
+            else '{"action":"...","box_2d":[ymin,xmin,ymax,xmax] or null}'
         )
+        prompt = (
+            f"Drive a robot car toward: '{target}'. Recent actions: {recent}.\n"
+            f"Reply with only compact JSON, no whitespace: {shape}\n"
+            "action: approach (goal visible, give box_2d) | search_left | "
+            "search_right (not visible, keep turning the same way) | "
+            "back_off (blocked) | stop (reached it).\n"
+            "box_2d is normalized 0-1000."
+        )
+        if self._explain:
+            prompt += " reason: under 6 words."
+        return prompt
 
 
 HISTORY_LENGTH = 4

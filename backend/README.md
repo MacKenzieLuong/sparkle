@@ -326,6 +326,8 @@ Debug endpoints return `400` when the providers are not fake.
 | `DRIVER` | `fake` | `fake` or `tb6612` (`l298n` accepted as an alias) |
 | `VISION_MAX_TOKENS` | `128` | Small response limit for bounding-box JSON |
 | `VISION_TIMEOUT` | `10` | Per-request timeout in seconds; retries are disabled |
+| `VISION_WIDTH` / `VISION_HEIGHT` | `0` / `0` | Downscale before sending; `0` keeps camera resolution. 320x240 is 80 image tokens against 300 at 640x480 |
+| `VISION_EXPLAIN` | `false` | Ask the model to justify its action. Readable while tuning, but output tokens are generated serially and cost latency on every call |
 | `MAX_COST_USD` | `1.00` | Estimated spend cap for the process; `0` disables it |
 | `VISION_INPUT_USD_PER_MILLION` | `0.55` | Image-token input rate used by the estimate |
 | `VISION_OUTPUT_USD_PER_MILLION` | `2.20` | Output-token rate used by the estimate |
