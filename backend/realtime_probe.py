@@ -35,6 +35,14 @@ PROMPT = (
     "Find the red ball. box_2d normalized 0-1000, or null if absent."
 )
 
+# Answerable only by looking. A shape that is parsed but silently drops the
+# payload still returns a confident-sounding answer, so "it did not error" is
+# not evidence the model saw anything.
+VERIFY_PROMPT = "Reply with exactly one word: the colour of the circle in the picture."
+VERIFY_ANSWER = "red"
+# An image costs far more than this; a reply that adds nothing never carried one.
+MIN_IMAGE_TOKENS = 25
+
 
 def test_frame(width: int = 320, height: int = 240) -> str:
     """A grey frame with one red circle, right of centre. Known ground truth."""
@@ -71,16 +79,22 @@ def test_video(width: int = 320, height: int = 240, frames: int = 4) -> str:
 
 
 def payload_shapes(data_url: str, bare_b64: str, video_url: str) -> list[tuple[str, dict]]:
-    """Every plausible spelling, each tried on its own fresh connection."""
+    """Every plausible spelling, each tried on its own fresh connection.
+
+    Ordered by what the server's own errors imply: image_url reached a video
+    decoder ("Invalid video file") and rejected raw base64 as not a URL, so it
+    wants a URL carrying video. Those combinations go first.
+    """
     return [
+        ("image_url <- mp4 data url", {"type": "input_image", "image_url": video_url}),
+        ("input_video <- mp4", {"type": "input_video", "video_url": video_url}),
+        ("input_video nested mp4", {"type": "input_video", "video_url": {"url": video_url}}),
+        ("video_url nested mp4", {"type": "video_url", "video_url": {"url": video_url}}),
+        ("input_image 'image' key", {"type": "input_image", "image": data_url}),
         ("input_image bare url", {"type": "input_image", "image_url": data_url}),
         ("input_image nested url", {"type": "input_image", "image_url": {"url": data_url}}),
         ("image_url nested url", {"type": "image_url", "image_url": {"url": data_url}}),
         ("input_image raw base64", {"type": "input_image", "image_url": bare_b64}),
-        ("input_image 'image' key", {"type": "input_image", "image": data_url}),
-        ("input_video video_url", {"type": "input_video", "video_url": video_url}),
-        ("input_video nested url", {"type": "input_video", "video_url": {"url": video_url}}),
-        ("video_url nested url", {"type": "video_url", "video_url": {"url": video_url}}),
     ]
 
 
@@ -157,30 +171,53 @@ def open_session(connect, url: str, api_key: str):
     return ws
 
 
-def try_shape(connect, url: str, api_key: str, name: str, part: dict) -> Optional[dict]:
-    """Test one content shape on its own connection.
+def input_tokens_of(done: dict) -> Optional[int]:
+    usage = (done.get("response") or {}).get("usage") or {}
+    value = usage.get("input_tokens")
+    return value if isinstance(value, int) else None
+
+
+def try_shape(
+    connect, url: str, api_key: str, name: str, part: dict, baseline: Optional[int]
+) -> Optional[dict]:
+    """Test one content shape on its own connection, and check it was read.
 
     A rejected payload kills the socket, so sharing one across attempts makes
     every later variant report a dead-socket error instead of its own verdict.
+    Not erroring is also not success: a dropped payload still yields a fluent
+    answer, so the model is asked something only the picture can answer, and
+    the input-token count is compared against the same question asked blind.
     """
     try:
         ws = open_session(connect, url, api_key)
     except Exception as exc:
-        print(f"  {name:24} could not open a session: {exc}")
+        print(f"  {name:26} could not open a session: {exc}")
         return None
     try:
-        text, done, elapsed = ask(ws, [part, {"type": "input_text", "text": PROMPT}])
-        print(f"  {name:24} {elapsed * 1000:7.0f} ms  {text!r}  ({usage_of(done)})")
-        return part
+        text, done, elapsed = ask(ws, [part, {"type": "input_text", "text": VERIFY_PROMPT}])
     except Exception as exc:
-        message = str(exc).replace("\n", " ")[:150]
-        print(f"  {name:24} rejected: {message}")
+        print(f"  {name:26} rejected: {str(exc).replace(chr(10), ' ')[:140]}")
         return None
     finally:
         try:
             ws.close()
         except Exception:
             pass
+
+    tokens = input_tokens_of(done)
+    named_colour = VERIFY_ANSWER in text.lower()
+    grew = (
+        baseline is not None and tokens is not None and tokens - baseline >= MIN_IMAGE_TOKENS
+    )
+    verdict = "SAW IT" if named_colour and grew else (
+        "answered but no image tokens" if named_colour else "did not see the picture"
+    )
+    delta = "?" if tokens is None or baseline is None else f"{tokens - baseline:+d}"
+    print(
+        f"  {name:26} {elapsed * 1000:7.0f} ms  {text.strip()[:28]!r:30} "
+        f"in={tokens} ({delta} vs blind)  {verdict}"
+    )
+    return part if named_colour and grew else None
 
 
 def main() -> int:
@@ -217,9 +254,15 @@ def main() -> int:
     ws = open_session(connect, url, api_key)
     handshake = time.monotonic() - connect_started
     print(f"handshake {handshake * 1000:.0f} ms (paid once if the socket is held open)")
+    baseline: Optional[int] = None
     try:
-        text, done, elapsed = ask(ws, [{"type": "input_text", "text": "Reply with the word OK."}])
-        print(f"text turn {elapsed * 1000:.0f} ms  {text!r}  ({usage_of(done)})\n")
+        # The same question with no picture: the control for every shape below.
+        text, done, elapsed = ask(ws, [{"type": "input_text", "text": VERIFY_PROMPT}])
+        baseline = input_tokens_of(done)
+        print(
+            f"blind     {elapsed * 1000:.0f} ms  {text.strip()[:28]!r}  in={baseline}"
+            "  <- asked with no image, for comparison\n"
+        )
     except Exception as exc:
         print(f"text turn FAILED: {exc}")
         return 1
@@ -229,17 +272,20 @@ def main() -> int:
         except Exception:
             pass
 
-    print("Each shape below gets its own connection — a rejected payload closes")
-    print("the socket, so sharing one makes every later attempt look broken.\n")
+    print("Each shape gets its own connection — a rejected payload closes the")
+    print("socket. A shape only counts if the reply names the colour AND the")
+    print("input tokens grow: a dropped payload still answers confidently.\n")
     working: Optional[dict] = None
     for name, part in payload_shapes(data_url, bare_b64, video_url):
-        working = try_shape(connect, url, api_key, name, part)
+        working = try_shape(connect, url, api_key, name, part, baseline)
         if working is not None:
             break
 
     if working is None:
-        print("\nNothing accepted a frame. Realtime stays text-only for this model,")
-        print("so HTTP remains the only way to send pictures.")
+        print("\nNothing carried a frame the model could actually read.")
+        print("Shapes that answered without extra input tokens were parsed and")
+        print("then dropped — the reply is the model guessing from text alone.")
+        print("Next step: probe Gemini 3.1 Flash Live, which is built for video.")
         return 1
 
     print(f"\nAccepted. Timing {args.repeat} more on ONE warm socket:")
