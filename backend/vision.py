@@ -29,10 +29,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# What the model is allowed to decide. Local code executes these; it never
+# invents one, and anything outside this set is treated as a stop.
+ACTIONS = ("approach", "search_left", "search_right", "back_off", "stop")
+
+
 @dataclass
 class DetectedObject:
-    box_2d: Box2D
+    box_2d: Optional[Box2D]
     label: str
+    action: str = "approach"
+    reason: str = ""
 
 
 class VisionProvider:
@@ -47,14 +54,20 @@ class VisionProvider:
 
 
 class FakeVision(VisionProvider):
-    def __init__(self, scene: FakeScene):
+    def __init__(self, scene: FakeScene, missing_action: str = "search_right"):
         self._scene = scene
+        # A scripted "not in frame" stands in for the model deciding to look
+        # around, which is what the real one does rather than returning nothing.
+        self._missing_action = missing_action
 
     def detect(self, target: str, frame: np.ndarray) -> Optional[DetectedObject]:
         box_2d = self._scene.advance()
         if box_2d is None:
-            return None
-        return DetectedObject(box_2d=box_2d, label=target)
+            return DetectedObject(
+                box_2d=None, label=target,
+                action=self._missing_action, reason="scripted miss",
+            )
+        return DetectedObject(box_2d=box_2d, label=target, action="approach")
 
 
 class OmniVision(VisionProvider):
@@ -89,7 +102,11 @@ class OmniVision(VisionProvider):
         self._input_rate = _env_float("VISION_INPUT_USD_PER_MILLION", 0.55)
         self._output_rate = _env_float("VISION_OUTPUT_USD_PER_MILLION", 2.20)
         self._spent = 0.0
+        self._history: List[str] = []
         self.last_raw: Optional[str] = None
+
+    def start(self, target: str) -> None:
+        self._history.clear()
 
     @property
     def estimated_spend_usd(self) -> float:
@@ -126,13 +143,7 @@ class OmniVision(VisionProvider):
 
         data_url = "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
 
-        prompt = (
-            f"Detect the object described as '{target}' in this image. "
-            'Respond with a JSON array of bounding boxes matching exactly this shape: '
-            '[{"box_2d": [ymin, xmin, ymax, xmax], "label": "..."}, ...] '
-            "with coordinates normalized to 0-1000. "
-            "If the object is not present, respond with []. Return only the JSON."
-        )
+        prompt = self._prompt(target)
 
         stream = self._client.chat.completions.create(
             model=self._model,
@@ -156,11 +167,89 @@ class OmniVision(VisionProvider):
                 text += chunk.choices[0].delta.content
 
         self.last_raw = text
+        plan = _parse_plan(text, target)
+        if plan is None:
+            return None
+        self._history.append(plan.action)
+        del self._history[:-HISTORY_LENGTH]
+        return plan
+
+    def _prompt(self, target: str) -> str:
+        recent = ", ".join(self._history) if self._history else "none"
+        return (
+            f"You are driving a small robot car toward: '{target}'.\n"
+            f"Your recent actions, oldest first: {recent}\n"
+            "Look at the camera image and choose the next move.\n\n"
+            'Reply with only this JSON object:\n'
+            '{"action": "...", "box_2d": [ymin, xmin, ymax, xmax] or null, '
+            '"label": "...", "reason": "..."}\n\n'
+            "action must be exactly one of:\n"
+            "  approach     - the goal is visible; box_2d must give its box\n"
+            "  search_left  - goal not visible; turn left to look for it\n"
+            "  search_right - goal not visible; turn right to look for it\n"
+            "  back_off     - path blocked or far too close; reverse\n"
+            "  stop         - the car has reached the goal, or cannot continue\n\n"
+            "Use your recent actions so a search keeps turning the same way "
+            "instead of rocking back and forth. Coordinates are normalized to "
+            "0-1000 as [ymin, xmin, ymax, xmax]. Keep reason under 8 words."
+        )
+
+
+HISTORY_LENGTH = 4
+
+
+def _parse_plan(text: str, target: str) -> Optional[DetectedObject]:
+    """Read the model's decision, tolerating the shapes it actually emits.
+
+    Falls back to the older bare-array-of-boxes reply, and refuses to invent an
+    action: anything unrecognised becomes an approach when a box came with it,
+    and a stop when none did.
+    """
+    entry = _parse_object(text)
+    if entry is None:
         boxes = _parse_boxes(text)
         if not boxes:
             return None
-        box = boxes[0]
-        return DetectedObject(box_2d=tuple(box["box_2d"]), label=box.get("label", target))
+        entry = boxes[0]
+
+    coords = _coords_of(entry)
+    box = tuple(coords) if coords else None
+    action = entry.get("action")
+    if not isinstance(action, str) or action not in ACTIONS:
+        action = "approach" if box else "stop"
+    if action == "approach" and box is None:
+        action = "stop"
+
+    label = entry.get("label")
+    reason = entry.get("reason")
+    return DetectedObject(
+        box_2d=box,
+        label=label if isinstance(label, str) and label else target,
+        action=action,
+        reason=reason if isinstance(reason, str) else "",
+    )
+
+
+def _parse_object(text: str) -> Optional[dict]:
+    """The first JSON object in the reply, unwrapping a single-element list."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    for candidate in (text, _first_match(r"\{[\s\S]*\}", text)):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list) and len(data) == 1:
+            data = data[0]
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _first_match(pattern: str, text: str) -> Optional[str]:
+    match = re.search(pattern, text)
+    return match.group(0) if match else None
 
 
 def _parse_boxes(text: str) -> List[dict]:

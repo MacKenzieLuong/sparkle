@@ -11,7 +11,7 @@ import cv2
 from pydantic import BaseModel
 
 from camera import CameraProvider, FakeCamera, make_camera
-from controller import command
+from controller import act, command
 from drive import Driver, FakeDriver, make_driver
 from scenarios import SCENARIOS, FakeScene
 from vision import (
@@ -46,16 +46,20 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _blank_infer() -> dict:
-    return {"count": 0, "frame_no": None, "label": None, "box_2d": None}
+    return {
+        "count": 0, "frame_no": None, "label": None,
+        "box_2d": None, "action": None, "reason": None,
+    }
 
 
 class ControlLoop:
     """Perception and steering run on separate threads.
 
-    A model call takes seconds; steering must not. The perception thread
-    publishes the freshest box it can get, and the control thread steers off
-    that box at a fixed rate, cutting the motors whenever the box is older
-    than the observed perception cycle can account for.
+    A model call takes seconds; steering must not. The perception thread asks
+    the model what to do and publishes its latest decision; the control thread
+    executes that decision at a fixed rate, cutting the motors once it is older
+    than STALE_AFTER. The model chooses the action, this file chooses when to
+    stop obeying it.
     """
 
     def __init__(self, camera: CameraProvider, vision: VisionProvider, driver: Driver):
@@ -72,6 +76,7 @@ class ControlLoop:
         self._stale_after = _env_float("STALE_AFTER", 8.0)
         self._miss_limit = 3
         self._arrive_confirm = int(os.environ.get("ARRIVE_CONFIRM", "2"))
+        self._search_limit = int(os.environ.get("SEARCH_LIMIT", "8"))
         self._lock = threading.Lock()
         self._epoch = 0
         self._latest: Optional[DetectedObject] = None
@@ -85,6 +90,8 @@ class ControlLoop:
             "control_cycle": 0,
             "missed": 0,
             "arrived_streak": 0,
+            "search_streak": 0,
+            "action": None,
             "error": None,
             "detection_age": None,
             "last_command": None,
@@ -108,6 +115,8 @@ class ControlLoop:
                 control_cycle=0,
                 missed=0,
                 arrived_streak=0,
+                search_streak=0,
+                action=None,
                 error=None,
                 detection_age=None,
                 last_command=None,
@@ -160,6 +169,8 @@ class ControlLoop:
         area: Optional[float] = None
         previous_finish: Optional[float] = None
         arrived_streak = 0
+        search_streak = 0
+        last_terminal: Optional[str] = None
         while self._active(epoch):
             frame_no = None
             error = None
@@ -186,7 +197,11 @@ class ControlLoop:
                 infer["count"] += 1
                 infer["frame_no"] = frame_no
                 infer["label"] = detection.label if detection else None
-                infer["box_2d"] = list(detection.box_2d) if detection else None
+                infer["box_2d"] = (
+                    list(detection.box_2d) if detection and detection.box_2d else None
+                )
+                infer["action"] = detection.action if detection else None
+                infer["reason"] = detection.reason if detection else None
                 if detection is None:
                     self.state["missed"] += 1
                 else:
@@ -201,16 +216,40 @@ class ControlLoop:
                 return
 
             if detection is not None:
-                result = command(detection.box_2d)
+                result = act(detection.action, detection.box_2d)
                 area = result.area_fraction
+
+                # A search that never finds anything must still end. The model
+                # decides which way to look; this bounds how long it may look.
+                searching = detection.action in ("search_left", "search_right")
+                search_streak = search_streak + 1 if searching else 0
+
                 # One hallucinated full-frame box reads as arrival. The control
                 # thread already halts on it; only end the run once successive
                 # detections agree, so a bad frame costs a pause, not the drive.
-                arrived_streak = arrived_streak + 1 if result.status == "arrived" else 0
+                terminal = (
+                    "arrived" if result.status == "arrived"
+                    else "halted" if detection.action == "stop"
+                    else None
+                )
+                if terminal is None:
+                    arrived_streak = 0
+                elif terminal == last_terminal:
+                    arrived_streak += 1
+                else:
+                    arrived_streak = 1
+                last_terminal = terminal
+
                 with self._lock:
                     self.state["arrived_streak"] = arrived_streak
-                if arrived_streak >= self._arrive_confirm:
-                    self._finish("arrived", epoch)
+                    self.state["search_streak"] = search_streak
+                    self.state["action"] = detection.action
+
+                if terminal is not None and arrived_streak >= self._arrive_confirm:
+                    self._finish(terminal, epoch)
+                    return
+                if search_streak >= self._search_limit:
+                    self._finish("target_lost", epoch)
                     return
             time.sleep(self._pause(area))
 
@@ -227,7 +266,7 @@ class ControlLoop:
                 self.state["detection_age"] = None if age is None else round(age, 3)
 
             if detection is not None and fresh:
-                cmd = command(detection.box_2d)
+                cmd = act(detection.action, detection.box_2d)
                 self._driver.apply(cmd.left, cmd.right)
                 with self._lock:
                     if not self._owns(epoch):
@@ -239,7 +278,9 @@ class ControlLoop:
                         "status": cmd.status,
                         "note": cmd.note,
                         "label": detection.label,
-                        "box_2d": list(detection.box_2d),
+                        "action": detection.action,
+                        "reason": detection.reason,
+                        "box_2d": list(detection.box_2d) if detection.box_2d else None,
                         "area_fraction": round(cmd.area_fraction, 3),
                     }
             else:

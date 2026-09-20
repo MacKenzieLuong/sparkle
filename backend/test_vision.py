@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from vision import OmniVision, _parse_boxes
+from vision import OmniVision, _parse_boxes, _parse_plan
 
 
 def _frame():
@@ -75,6 +75,48 @@ def test_box_key_variants(key):
 def test_label_absent_leaves_caller_default():
     boxes = _parse_boxes('[{"bbox_2d": [1, 2, 3, 4]}]')
     assert boxes[0].get("label", "fallback") == "fallback"
+
+
+def test_plan_with_action_and_box():
+    plan = _parse_plan(
+        '```json\n{"action": "approach", "box_2d": [10, 20, 30, 40], '
+        '"label": "a chair", "reason": "chair ahead"}\n```',
+        "a chair",
+    )
+    assert plan.action == "approach"
+    assert plan.box_2d == (10, 20, 30, 40)
+    assert plan.label == "a chair"
+    assert plan.reason == "chair ahead"
+
+
+def test_plan_search_needs_no_box():
+    plan = _parse_plan('{"action": "search_left", "box_2d": null}', "a chair")
+    assert plan.action == "search_left"
+    assert plan.box_2d is None
+    assert plan.label == "a chair", "falls back to the requested target"
+
+
+def test_plan_falls_back_to_the_bare_box_reply():
+    """The older array-of-boxes shape still drives an approach."""
+    plan = _parse_plan('[{"bbox_2d": [1, 2, 3, 4], "label": "x"}]', "x")
+    assert plan.action == "approach"
+    assert plan.box_2d == (1, 2, 3, 4)
+
+
+def test_plan_refuses_to_invent_an_action():
+    halted = _parse_plan('{"action": "ram_it", "box_2d": null}', "x")
+    assert halted.action == "stop", "an unknown action with no box must not move"
+    boxed = _parse_plan('{"action": "ram_it", "box_2d": [1, 2, 3, 4]}', "x")
+    assert boxed.action == "approach"
+
+
+def test_approach_without_a_box_becomes_stop():
+    plan = _parse_plan('{"action": "approach", "box_2d": null}', "x")
+    assert plan.action == "stop"
+
+
+def test_plan_rejects_unusable_text():
+    assert _parse_plan("I cannot help with that", "x") is None
 
 
 def test_cost_cap_defaults_to_one_dollar(monkeypatch):

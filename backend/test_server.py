@@ -294,6 +294,87 @@ def test_repeated_arrival_still_ends_the_drive():
     assert driver.last == (0.0, 0.0)
 
 
+class PlanVision(VisionProvider):
+    """Replays a scripted sequence of model decisions.
+
+    The delay stands in for model latency; without it perception outruns the
+    control thread and a decision can expire before it is ever executed.
+    """
+
+    def __init__(self, plans, delay=0.05):
+        self._plans = list(plans)
+        self._delay = delay
+        self.calls = 0
+
+    def detect(self, target, frame):
+        time.sleep(self._delay)
+        action, box = self._plans[min(self.calls, len(self._plans) - 1)]
+        self.calls += 1
+        return DetectedObject(box_2d=box, label=target, action=action)
+
+
+def test_car_searches_then_drives_when_the_model_finds_it():
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_AFTER="30", SEARCH_LIMIT="8",
+        SEARCH_SPEED="0.25", BASE_SPEED="0.5",
+    ):
+        driver = FakeDriver()
+        vision = PlanVision(
+            [("search_right", None), ("search_right", None), ("approach", MOVING_BOX)]
+        )
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(
+            lambda: driver.last[0] > 0 > driver.last[1], "never rotated to search"
+        )
+        _wait_until(
+            lambda: driver.last[0] > 0 and driver.last[1] > 0, "never drove forward"
+        )
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["running"] is True
+    assert snap["action"] == "approach"
+    assert snap["status"] == "moving"
+
+
+def test_endless_search_gives_up():
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_AFTER="30", SEARCH_LIMIT="4",
+    ):
+        driver = FakeDriver()
+        vision = PlanVision([("search_left", None)])
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(lambda: not loop.snapshot()["running"], "search never gave up")
+        snap = loop.snapshot()
+
+    assert snap["status"] == "target_lost"
+    assert snap["search_streak"] >= 4
+    assert driver.last == (0.0, 0.0)
+
+
+def test_model_stop_needs_confirming_too():
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_AFTER="30", ARRIVE_CONFIRM="2",
+    ):
+        driver = FakeDriver()
+        vision = PlanVision(
+            [("approach", MOVING_BOX), ("stop", None), ("approach", MOVING_BOX),
+             ("approach", MOVING_BOX)]
+        )
+        loop = ControlLoop(FakeCamera(FakeScene(boxes=[])), vision, driver)
+        loop.start("a chair")
+        _wait_until(lambda: vision.calls >= 4, "loop stalled")
+        snap = loop.snapshot()
+        loop.stop()
+
+    assert snap["running"] is True, "a lone stop ended the run"
+
+
 def test_arrival_stops_navigation():
     with _env(MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100"):
         driver = FakeDriver()

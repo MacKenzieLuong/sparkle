@@ -1,14 +1,14 @@
 # Sparkle Backend — RC Car Autopilot
 
-Real-time "drive to the thing I named" API for a Raspberry Pi RC car. A web
-page takes a natural-language target (e.g. "go to the red ball"), a vision
-model finds the object in the camera frame, steering math turns that into left/
-right motor throttles, and the car drives until it arrives or loses the target.
+Give a Raspberry Pi RC car a goal in plain language — "go to the red ball" —
+and it works out how to get there. A multimodal model looks through the camera
+and decides what the car should do next; local code executes that decision
+smoothly and decides when to stop trusting it.
 
 ## Architecture
 
 A model call takes seconds; steering must not. So `POST /direct` starts two
-threads that share one "freshest box" record:
+threads that share one "latest decision" record:
 
 ```
 User types "go to the red ball" on web page
@@ -18,30 +18,31 @@ User types "go to the red ball" on web page
         │
         ├── perception thread ── every CONTROL_INTERVAL, immediately on Go:
         │     grab frame from camera ──────────► Pi Camera / rpicam-vid / fake
-        │     vision.detect(target, frame) ────► OmniVision (yibuapi) or fake
-        │     JSON: [{"box_2d":[ymin,xmin,ymax,xmax],"label":...}] or not found
+        │     ask the model what to do ────────► OmniVision (yibuapi) or fake
+        │       sees: frame + goal + its own recent actions
+        │       answers: {"action": "approach", "box_2d": [...], "reason": ...}
         │            │
         │            ▼
-        │     ┌──────────────────────┐
-        │     │ latest box + arrival │  ◄── shared, lock-guarded
-        │     │ timestamp            │
-        │     └──────────────────────┘
+        │     ┌────────────────────────┐
+        │     │ latest decision + when │  ◄── shared, lock-guarded
+        │     └────────────────────────┘
         │            │
         └── control thread ── every 1/CONTROL_HZ (default 10 Hz):
-              read freshest box; if older than the deadman window → motors off
-              else controller.command(box) ────► left/right throttle in [-1, 1]
-                     box center vs frame center → turn
-                     box size → approach speed; ≥50% of frame → arrived
+              decision older than STALE_AFTER? → motors off
+              else controller.act(action, box) ──► left/right throttle in [-1, 1]
+                     approach → steer at the box, slow as it fills the frame
+                     search_* → rotate in place to look around
+                     back_off → reverse;  stop → hold still
                      │
                      ▼
               Motor driver: H-bridge (dual TB6612FNG) on GPIO or fake (logs)
 ```
 
-The car therefore keeps steering at a steady 10 Hz off the last box it saw,
+The car keeps acting at a steady 10 Hz on the last decision it received,
 instead of freezing for the whole duration of each model round trip. If
-perception stalls — hung request, dead camera, dropped network — the box goes
-stale and the control thread cuts the motors without waiting for the request
-to time out.
+perception stalls — hung request, dead camera, dropped network — the decision
+goes stale and the control thread cuts the motors without waiting for the
+request to time out.
 
 ## Layout
 
@@ -49,8 +50,8 @@ to time out.
 | --- | --- |
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
 | `cli.py` | One-shot detection from the terminal — model check without the car |
-| `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (real inference via yibuapi) |
-| `controller.py` | Pure steering math: bounding box → `DriveCommand(left, right, status)` |
+| `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (asks the model what to do) |
+| `controller.py` | Executes the model's action under local speed limits; `command()` is the pure steering math |
 | `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
 | `drive.py` | `TB6612Driver` (dual TB6612FNG, gpiozero), `FakeDriver` (logs) |
 | `scenarios.py` | Scripted bounding-box scenarios shared by `FakeVision` and `FakeCamera` |
@@ -163,12 +164,13 @@ cadence is still latency-bound (model round trip + the configured pause).
 
 ## The inference model
 
-One model does object detection: `qwen3.8-omni-flash` (a Qwen Omni
-multimodal model) reached through the sponsor's OpenAI-compatible gateway
+One model does both the seeing and the deciding: `qwen3.8-omni-flash` (a Qwen
+Omni multimodal model) reached through the sponsor's OpenAI-compatible gateway
 (yibuapi). It is a general multimodal LLM, not a purpose-trained detector like
-YOLO — it is prompted to return bounding-box JSON and boxes are parsed
-leniently (`vision._parse_boxes`), so approximate output degrades to "not
-found" rather than crashing the loop. To keep cost/latency down, only one
+YOLO — it is prompted to return a decision as JSON, parsed leniently
+(`vision._parse_plan`), so approximate output degrades to a halt rather than
+crashing the loop. Measured round trip on a Pi 5 with an imx708: **2.5–4.3 s**,
+median ~3.4 s. To keep cost/latency down, only one
 downscaled JPEG frame is sent per cycle and calls run at the 5s cadence.
 
 Detection contract (same shape the steering math consumes):
@@ -180,6 +182,35 @@ Detection contract (same shape the steering math consumes):
 Coordinates are normalized to `0–1000` for a 1000×1000 reference frame
 (`box_2d` order is `ymin, xmin, ymax, xmax`). An empty array means the target
 is not in frame.
+
+## What the model decides
+
+The model is not a box detector wired to a formula. Each cycle it is shown the
+camera frame, the goal, and its own recent actions, and it answers with a
+decision:
+
+```json
+{"action": "approach", "box_2d": [607, 106, 999, 843],
+ "label": "a chair", "reason": "chair ahead slightly left"}
+```
+
+| action | what the car does |
+| --- | --- |
+| `approach` | steer toward `box_2d` using the math below |
+| `search_left` / `search_right` | rotate in place at `SEARCH_SPEED` to look for the goal |
+| `back_off` | reverse at `BACK_OFF_SPEED` — blocked, or far too close |
+| `stop` | hold still; ends the run once `ARRIVE_CONFIRM` replies agree |
+
+The split matters because a model call takes seconds. **The model chooses what
+to do; this code chooses how fast and for how long.** Speeds live in
+`controller.act`, so no reply can make the car move faster than the machine was
+configured to allow, an unrecognised action halts rather than being guessed at,
+and an `approach` with no box becomes a `stop`. Sending its own recent actions
+back to it is what stops a search rocking left-right-left; `SEARCH_LIMIT`
+(default 8) bounds how long it may hunt before giving up as `target_lost`.
+
+Replies in the older bare `[{"box_2d": ...}]` shape are still accepted and read
+as `approach`.
 
 ## Control loop behavior
 
@@ -216,7 +247,8 @@ On `POST /direct`:
      the run only ends once another detection agrees. Live testing produced a
      hallucinated full-frame box between two good ones — under a single-frame
      rule that stops the car for good, mid-drive.
-   - **target_lost** — no detection for 3 consecutive perception cycles.
+   - **target_lost** — no usable reply for 3 consecutive perception cycles,
+     or `SEARCH_LIMIT` consecutive search actions without finding the goal.
      Camera and API errors count as misses, so a persistent failure ends the
      run rather than looping forever; the message lands in `status.error`.
    - **manual stop** — `POST /stop`.
@@ -304,6 +336,9 @@ Debug endpoints return `400` when the providers are not fake.
 | `DEAD_ZONE` | `0.08` | Horizontal offset below which the car drives straight |
 | `ARRIVED_AREA_FRACTION` | `0.5` | Box area fraction that counts as arrived |
 | `ARRIVE_CONFIRM` | `2` | Successive detections that must agree before the run ends |
+| `SEARCH_LIMIT` | `8` | Consecutive search cycles before giving up as `target_lost` |
+| `SEARCH_SPEED` | `0.25` | Wheel speed when rotating in place to look around |
+| `BACK_OFF_SPEED` | `0.2` | Reverse speed for `back_off` |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
 | `TB6612_AIN1`…`TB6612_STBY` | see `.env.example` | GPIO pins for the dual TB6612FNG (SparkFun) |
 | `TB6612_STBY` | `21` | Driver standby pin (held high to drive, low when stopped) |

@@ -22,6 +22,8 @@ DEAD_ZONE = _env_float("DEAD_ZONE", 0.08)
 ARRIVED_AREA_FRACTION = _env_float("ARRIVED_AREA_FRACTION", 0.5)
 BASE_SPEED = _env_float("BASE_SPEED", 0.5)
 TURN_GAIN = _env_float("TURN_GAIN", 0.8)
+SEARCH_SPEED = _env_float("SEARCH_SPEED", 0.25)
+BACK_OFF_SPEED = _env_float("BACK_OFF_SPEED", 0.2)
 
 
 @dataclass
@@ -64,3 +66,22 @@ def command(box_2d: Optional[Tuple[int, int, int, int]]) -> DriveCommand:
     return DriveCommand(
         left, right, "moving", f"dx {dx:.2f}, area {area_fraction:.2f}", area_fraction
     )
+
+
+def act(action: str, box_2d: Optional[Tuple[int, int, int, int]]) -> DriveCommand:
+    """Turn the model's decision into throttles.
+
+    The model chooses *what* to do; the speeds stay here, so no reply can make
+    the car move faster than this machine was configured to allow.
+    """
+    if action == "approach":
+        return command(box_2d)
+    if action == "search_left":
+        return DriveCommand(-SEARCH_SPEED, SEARCH_SPEED, "searching", "scanning left")
+    if action == "search_right":
+        return DriveCommand(SEARCH_SPEED, -SEARCH_SPEED, "searching", "scanning right")
+    if action == "back_off":
+        return DriveCommand(
+            -BACK_OFF_SPEED, -BACK_OFF_SPEED, "backing_off", "clearing space"
+        )
+    return DriveCommand(0.0, 0.0, "halted", f"model said {action}")

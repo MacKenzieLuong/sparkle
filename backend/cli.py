@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 
 from camera import describe_cameras, make_camera
-from controller import command
+from controller import act
 from scenarios import SCENARIOS
 from vision import is_mock, make_vision
 
@@ -44,13 +44,15 @@ def describe(detection, elapsed: float, raw: Optional[str], show_raw: bool) -> N
     if show_raw and raw is not None:
         print(f"raw={raw.strip()!r}", end="  ")
     if detection is None:
-        print("not found")
+        print("no usable reply")
         return
-    cmd = command(detection.box_2d)
+    cmd = act(detection.action, detection.box_2d)
+    where = f"box={list(detection.box_2d)}" if detection.box_2d else "no box"
+    note = f" [{detection.reason}]" if detection.reason else ""
     print(
-        f"{detection.label!r} box={list(detection.box_2d)} "
+        f"{detection.action} {detection.label!r} {where} "
         f"area={cmd.area_fraction:.3f} -> left={cmd.left:+.2f} "
-        f"right={cmd.right:+.2f} ({cmd.status})"
+        f"right={cmd.right:+.2f} ({cmd.status}){note}"
     )
 
 
@@ -124,7 +126,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             elapsed.append(took)
             describe(detection, took, getattr(vision, "last_raw", None), args.raw)
 
-            if detection is not None:
+            if detection is not None and detection.box_2d:
                 found += 1
                 if args.save:
                     path = f"{args.save}-{attempt}.jpg"

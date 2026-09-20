@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from controller import command
+from controller import act, command
 
 
 def _throttle_with(**env) -> float:
@@ -117,6 +117,33 @@ def test_turn_gain_is_configurable():
     gentle = float(hard.stdout.strip())
     reference = command((300, 750, 700, 950))
     assert 0 < gentle < (reference.left - reference.right)
+
+
+def test_search_actions_rotate_in_place():
+    left = act("search_left", None)
+    right = act("search_right", None)
+    assert left.status == "searching"
+    assert left.left < 0 < left.right, "left search spins counter-clockwise"
+    assert right.right < 0 < right.left
+    assert left.left == pytest.approx(-right.left)
+
+
+def test_back_off_reverses_both_wheels():
+    cmd = act("back_off", None)
+    assert cmd.left < 0 and cmd.right < 0
+    assert cmd.status == "backing_off"
+
+
+def test_approach_uses_the_steering_math():
+    box = (300, 750, 700, 950)
+    assert act("approach", box) == command(box)
+
+
+def test_unknown_action_halts():
+    for action in ("launch_missiles", "", "APPROACH"):
+        cmd = act(action, (300, 300, 700, 700))
+        assert (cmd.left, cmd.right) == (0.0, 0.0), action
+        assert cmd.status == "halted"
 
 
 def test_area_fraction_reported():
