@@ -51,6 +51,7 @@ request to time out.
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
 | `cli.py` | One-shot detection, camera listing and motor test from the terminal |
 | `run-demo.sh` | The full live configuration in one command |
+| `calibrate.py` | Measures what the car physically does: yaw rate, coast, deg/pixel, speed |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (asks the model what to do) |
 | `controller.py` | Executes the model's action under local speed limits; `command()` is the pure steering math |
 | `tracker.py` | Optical-flow box tracking that bridges the gap between model replies |
@@ -463,6 +464,41 @@ nothing drives the motors after a stop.
 
 No network and no API usage: the spend-guard tests assert the cap refuses the
 call *before* it reaches the client.
+
+## Calibration
+
+The steering math has no units. `dx` is a fraction of frame width, `TURN_GAIN`
+converts it to a throttle difference by guesswork, and nothing relates a
+throttle difference to degrees per second — so the controller cannot work out
+how long to turn for, only how hard. At a 3.4s round trip there is no feedback
+fast enough to correct that guess, which is why turns overshoot.
+
+`calibrate.py` measures the four missing constants. **The car must be on the
+floor with clear space**; on blocks the wheels turn without the body rotating
+and every number is meaningless.
+
+```sh
+DRIVER=tb6612 CAMERA=rpicam .venv/bin/python calibrate.py
+```
+
+| measured | what it gives |
+| --- | --- |
+| yaw rate, deg/s per throttle difference | an angle becomes a turn *duration* |
+| coast, deg after power is cut | a pivoting car keeps going; this is most of the overshoot |
+| deg per pixel | `dx` becomes a real angle |
+| forward speed, m/s | how far the car travels blind between confirmations |
+
+Yaw rate and coast come from one experiment run at two durations, since
+`angle(t) = rate * t + coast` solves for both. Degrees per pixel is measured
+with optical flow rather than a protractor: the car turns by a known angle and
+the image reports how far it moved, which captures the lens *and* whatever crop
+`rpicam-vid` applied. Neither can be taken from a datasheet — a skid-steer car
+slips, by an amount that depends on the surface.
+
+The numbers land in `calibration.json`, and the tool prints what they imply,
+e.g. *"a target at the frame edge is 32 deg off centre; at differential 0.3
+turn for 0.80s, or 0.42s allowing for 15 deg of coast"*. That gap between 0.80
+and 0.42 is the overshoot, and no value of `TURN_GAIN` closes it.
 
 ## Live demo runbook
 
