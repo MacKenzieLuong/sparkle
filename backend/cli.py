@@ -56,6 +56,51 @@ def describe(detection, elapsed: float, raw: Optional[str], show_raw: bool) -> N
     )
 
 
+MOTOR_STEPS = [
+    ("left wheel FORWARD", 0.4, 0.0),
+    ("left wheel BACK", -0.4, 0.0),
+    ("right wheel FORWARD", 0.0, 0.4),
+    ("right wheel BACK", 0.0, -0.4),
+    ("both FORWARD", 0.4, 0.4),
+    ("pivot RIGHT (left fwd, right back)", 0.4, -0.4),
+]
+
+
+def test_motors(step_seconds: float) -> int:
+    """Drive each wheel in turn so wiring can be checked against reality.
+
+    Direction and left/right mapping are physical facts no test can assert, so
+    this prints what should happen and lets you watch whether it does.
+    """
+    from drive import make_driver
+
+    driver = make_driver()
+    print(f"Driver: {type(driver).__name__}")
+    print("PUT THE CAR ON BLOCKS — wheels will turn. Ctrl-C to abort.")
+    for count in (3, 2, 1):
+        print(f"  {count}...", flush=True)
+        time.sleep(1)
+
+    try:
+        for description, left, right in MOTOR_STEPS:
+            print(f"  {description:38} left={left:+.1f} right={right:+.1f}", flush=True)
+            driver.apply(left, right)
+            time.sleep(step_seconds)
+            driver.stop()
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        print("\naborted")
+        return 1
+    finally:
+        driver.stop()
+
+    print("\nEach step should match the wheel and direction named.")
+    print("If a wheel ran backwards, swap that motor's two direction pins")
+    print("(TB6612_AIN1/AIN2 for the left, TB6612_BIN1/BIN2 for the right).")
+    print("If the wrong wheel moved, swap the A and B pin groups.")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="One-shot object detection against the configured vision model."
@@ -67,6 +112,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--list-cameras",
         action="store_true",
         help="report available cameras and anything holding them, then exit",
+    )
+    parser.add_argument(
+        "--test-motors",
+        action="store_true",
+        help="drive each wheel in turn to check wiring, then exit (car on blocks)",
+    )
+    parser.add_argument(
+        "--motor-seconds", type=float, default=1.0, help="length of each motor step"
     )
     parser.add_argument("--image", help="detect against this file instead of the camera")
     parser.add_argument("-n", "--repeat", type=int, default=1, help="number of looks")
@@ -80,6 +133,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_cameras:
         print(describe_cameras())
         return 0
+    if args.test_motors:
+        return test_motors(args.motor_seconds)
     if not args.target:
         parser.error("target is required (or pass --list-cameras)")
 

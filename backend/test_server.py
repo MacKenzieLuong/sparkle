@@ -375,6 +375,27 @@ def test_model_stop_needs_confirming_too():
     assert snap["running"] is True, "a lone stop ended the run"
 
 
+def test_run_stops_at_the_time_limit():
+    """The backstop for a drive nobody can reach to stop."""
+    with _env(
+        MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0",
+        CONTROL_HZ="100", STALE_AFTER="30", MAX_RUN_SECONDS="0.4",
+    ):
+        driver = FakeDriver()
+        loop = ControlLoop(
+            FakeCamera(FakeScene(boxes=[])), SlowVision(MOVING_BOX, delay=0.02), driver
+        )
+        loop.start("a chair")
+        _wait_until(lambda: driver.last != (0.0, 0.0), "car never started driving")
+        _wait_until(
+            lambda: not loop.snapshot()["running"], "ran past the limit", timeout=3.0
+        )
+        snap = loop.snapshot()
+
+    assert snap["status"] == "time_limit"
+    assert driver.last == (0.0, 0.0)
+
+
 def test_arrival_stops_navigation():
     with _env(MOCK="true", CONTROL_INTERVAL="0", SHORT_INTERVAL="0", CONTROL_HZ="100"):
         driver = FakeDriver()

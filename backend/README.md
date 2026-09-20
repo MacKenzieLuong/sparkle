@@ -49,7 +49,7 @@ request to time out.
 | File | Purpose |
 | --- | --- |
 | `server.py` | FastAPI app, MJPEG stream, `ControlLoop` (perception + control threads), debug endpoints |
-| `cli.py` | One-shot detection from the terminal — model check without the car |
+| `cli.py` | One-shot detection, camera listing and motor test from the terminal |
 | `vision.py` | `VisionProvider` interface, `FakeVision` (scripted), `OmniVision` (asks the model what to do) |
 | `controller.py` | Executes the model's action under local speed limits; `command()` is the pure steering math |
 | `camera.py` | `PiCamera` (picamera2 CSI), `RpiCamCamera` (rpicam-vid MJPEG), `WebcamCamera`, `FakeCamera` (synthetic frames) |
@@ -251,6 +251,9 @@ On `POST /direct`:
      or `SEARCH_LIMIT` consecutive search actions without finding the goal.
      Camera and API errors count as misses, so a persistent failure ends the
      run rather than looping forever; the message lands in `status.error`.
+   - **time_limit** — `MAX_RUN_SECONDS` (default 120) elapsed. If the network
+     drops, `/stop` cannot be reached and nothing else bounds a drive that
+     never arrives.
    - **manual stop** — `POST /stop`.
 
 Restarting with a new target bumps an epoch counter that orphans the previous
@@ -337,6 +340,7 @@ Debug endpoints return `400` when the providers are not fake.
 | `ARRIVED_AREA_FRACTION` | `0.5` | Box area fraction that counts as arrived |
 | `ARRIVE_CONFIRM` | `2` | Successive detections that must agree before the run ends |
 | `SEARCH_LIMIT` | `8` | Consecutive search cycles before giving up as `target_lost` |
+| `MAX_RUN_SECONDS` | `120` | Hard cap on one drive; `0` disables. The backstop when `/stop` is unreachable |
 | `SEARCH_SPEED` | `0.25` | Wheel speed when rotating in place to look around |
 | `BACK_OFF_SPEED` | `0.2` | Reverse speed for `back_off` |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Uvicorn bind address |
@@ -360,6 +364,58 @@ nothing drives the motors after a stop.
 
 No network and no API usage: the spend-guard tests assert the cap refuses the
 call *before* it reaches the client.
+
+## Live demo runbook
+
+Each step is cheap and reversible, and each one fails in a way that tells you
+what is wrong. Do not skip ahead — every step below caught a real bug the first
+time it was run.
+
+**1. Camera, no model, no motors.** Zero spend.
+
+```sh
+.venv/bin/python cli.py --list-cameras
+MOCK=true CAMERA=rpicam .venv/bin/python cli.py "anything" --save cam
+```
+`cam-1.jpg` must be a real photo. If the camera fails to acquire, check nothing
+else holds it — libcamera reports a camera in use exactly like an absent one.
+
+**2. Motors, no model, no camera.** Car on blocks, wheels free.
+
+```sh
+DRIVER=tb6612 .venv/bin/python cli.py --test-motors
+```
+Each step names a wheel and a direction; watch that the right wheel turns the
+right way. Wrong direction → swap that motor's two direction pins. Wrong wheel
+→ swap the A and B groups.
+
+**3. Model, no motors.** A few cents.
+
+```sh
+export MOCK=false HUAWEI_API_KEY=<key> CAMERA=rpicam MAX_COST_USD=0.05
+.venv/bin/python cli.py "a chair" -n 5 --interval 1 --raw --save look
+```
+Check the boxes land on the object in `look-*.jpg`, and note the latency
+spread — that number sets `STALE_AFTER` and bounds a safe `BASE_SPEED`.
+
+**4. Whole loop, motors disconnected.**
+
+```sh
+export DRIVER=fake CONTROL_INTERVAL=0 MAX_COST_USD=0.25 MAX_RUN_SECONDS=120
+export BASE_SPEED=0.2 TURN_GAIN=0.3
+.venv/bin/python server.py
+```
+Drive the target around by hand in front of the lens and watch `/status`:
+`control_cycle` should outpace `cycle` about 10:1, `detection_age` should
+sawtooth below `stale_after`, and `action` should switch to a search when you
+take the target out of frame.
+
+**5. Motors on blocks.** Same as step 4 with `DRIVER=tb6612`. The wheels now
+follow the model's decisions with the car going nowhere.
+
+**6. On the floor.** Start slow and in open space. `MAX_RUN_SECONDS` is the
+backstop if the car drives out of wifi range; the web UI's stop button is the
+one you should actually be reaching for.
 
 ## Running on the Pi
 

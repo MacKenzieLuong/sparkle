@@ -77,11 +77,15 @@ class ControlLoop:
         self._miss_limit = 3
         self._arrive_confirm = int(os.environ.get("ARRIVE_CONFIRM", "2"))
         self._search_limit = int(os.environ.get("SEARCH_LIMIT", "8"))
+        # Last resort: if the network drops, /stop is unreachable and nothing
+        # else bounds a drive that never arrives.
+        self._max_run_seconds = _env_float("MAX_RUN_SECONDS", 120.0)
         self._lock = threading.Lock()
         self._epoch = 0
         self._latest: Optional[DetectedObject] = None
         self._latest_at: Optional[float] = None
         self._cycle_time: Optional[float] = None
+        self._started_at = 0.0
         self.state = {
             "running": False,
             "target": None,
@@ -107,6 +111,7 @@ class ControlLoop:
             self._latest = None
             self._latest_at = None
             self._cycle_time = None
+            self._started_at = time.monotonic()
             self.state.update(
                 running=True,
                 target=target,
@@ -256,6 +261,16 @@ class ControlLoop:
     def _control(self, epoch: int) -> None:
         while self._active(epoch):
             now = time.monotonic()
+            with self._lock:
+                if not self._owns(epoch):
+                    return
+                overrun = (
+                    self._max_run_seconds > 0
+                    and now - self._started_at >= self._max_run_seconds
+                )
+            if overrun:
+                self._finish("time_limit", epoch)
+                return
             with self._lock:
                 if not self._owns(epoch):
                     return
