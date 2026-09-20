@@ -280,17 +280,6 @@ class FakeCamera(CameraProvider):
                 (0, 255, 0),
                 1,
             )
-            cv2.putText(
-                frame,
-                "SIMULATED CAMERA",
-                (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (200, 200, 200),
-                1,
-                cv2.LINE_AA,
-            )
-
             box = self._scene.peek()
             if box is not None:
                 ymin, xmin, ymax, xmax = box
